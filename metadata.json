@@ -1,0 +1,8 @@
+{
+  "name": "L’Arbre des Wici — Archives Familiales",
+  "description": "Arbre généalogique interactif et paramétrable d'inspiration haute horlogerie et édition d'art pour la famille Wici.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

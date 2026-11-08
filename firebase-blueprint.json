@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "PersonPhoto": {
+      "title": "PersonPhoto",
+      "description": "Photo de portrait recadrée et optimisée pour un membre de la famille Wici",
+      "type": "object",
+      "properties": {
+        "personId": {
+          "type": "string",
+          "description": "Identifiant unique du membre de la famille",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "photoDataUrl": {
+          "type": "string",
+          "description": "Image recadrée et compressée au format Data URL (JPEG/WebP)",
+          "minLength": 10,
+          "maxLength": 500000
+        },
+        "shape": {
+          "type": "string",
+          "description": "Forme du masque de recadrage (circle, oval, portrait, square)",
+          "maxLength": 32
+        },
+        "filter": {
+          "type": "string",
+          "description": "Filtre esthétique appliqué (none, sepia, bw, warm)",
+          "maxLength": 32
+        },
+        "caption": {
+          "type": "string",
+          "description": "Légende ou date approximative de la prise de vue",
+          "maxLength": 256
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Horodatage de la dernière modification",
+          "maxLength": 64
+        },
+        "uploadedBy": {
+          "type": "string",
+          "description": "Identifiant Firebase Auth de l'auteur de l'envoi",
+          "maxLength": 128
+        }
+      },
+      "required": ["personId", "photoDataUrl", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/personPhotos/{personId}": {
+      "schema": "PersonPhoto",
+      "description": "Collection racine stockant les portraits de chaque membre de l'arbre généalogique indexés par personId"
+    }
+  }
+}
