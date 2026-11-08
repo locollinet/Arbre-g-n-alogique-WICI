@@ -1,18 +1,27 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Membership is provisioned manually in Firebase Console or via the Admin SDK.
-    // No client can grant itself access. See README before deploying these rules.
+    // Membership is provisioned manually in Firebase Console or via the Admin SDK,
+    // and bootstrapped for the project owner.
+    function isAdmin() {
+      return request.auth != null &&
+        request.auth.token.email == 'locollinet@gmail.com' &&
+        request.auth.token.email_verified == true;
+    }
     function memberPath() {
       return /databases/$(database)/documents/familyAccess/$(request.auth.uid);
     }
     function isMember() {
-      return request.auth != null && exists(memberPath()) &&
-        get(memberPath()).data.role in ['viewer', 'editor', 'admin'];
+      return isAdmin() || (
+        request.auth != null && exists(memberPath()) &&
+        get(memberPath()).data.role in ['viewer', 'editor', 'admin']
+      );
     }
     function isEditor() {
-      return request.auth != null && exists(memberPath()) &&
-        get(memberPath()).data.role in ['editor', 'admin'];
+      return isAdmin() || (
+        request.auth != null && exists(memberPath()) &&
+        get(memberPath()).data.role in ['editor', 'admin']
+      );
     }
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
@@ -29,8 +38,8 @@ service cloud.firestore {
         && (!('uploadedBy' in data) || data.uploadedBy == request.auth.uid);
     }
     match /familyAccess/{uid} {
-      allow get: if request.auth != null && request.auth.uid == uid;
-      allow list, write: if false;
+      allow get: if request.auth != null && (request.auth.uid == uid || isAdmin());
+      allow list, write: if isAdmin();
     }
     match /personPhotos/{personId} {
       allow get, list: if isMember();

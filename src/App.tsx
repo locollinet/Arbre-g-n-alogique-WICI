@@ -88,9 +88,10 @@ export default function App() {
 
   // Firebase Cloud Auth & Data state
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [authInitialized, setAuthInitialized] = useState(false);
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
-  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
+  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible' | 'non-connecté'>('chargement');
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -110,12 +111,22 @@ export default function App() {
   useEffect(() => {
     const unsub = subscribeToAuth((user) => {
       setCurrentUser(user);
+      setAuthInitialized(true);
     });
     return () => unsub();
   }, []);
 
-  // 3. Subscribe to real-time Cloud Photos in Firestore
+  // 3. Subscribe to real-time Cloud Photos in Firestore only when authenticated
   useEffect(() => {
+    if (!authInitialized) return;
+
+    if (!currentUser) {
+      setCloudStatus('non-connecté');
+      setPhotosMap({});
+      return;
+    }
+
+    setCloudStatus('chargement');
     const unsub = subscribeToPersonPhotos(
       (cloudMap, fromCache) => {
         const previous = lastCloudPhotos.current;
@@ -146,7 +157,7 @@ export default function App() {
       }
     );
     return () => unsub();
-  }, [currentUser?.uid]);
+  }, [authInitialized, currentUser?.uid]);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -236,7 +247,7 @@ export default function App() {
 
     setSelectedPersonId(updated.id);
     notify(`Fiche de ${getFullName(updated)} enregistrée dans ce navigateur.`);
-    if (!people.some(p => p.id === updated.id) && updated.photo) {
+    if (!people.some(p => p.id === updated.id) && updated.photo && currentUser) {
       void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo }).then(record => {
         setPhotosMap(prev => ({ ...prev, [updated.id]: record }));
         notify(`Portrait de ${getFullName(updated)} envoyé dans le cloud ; sa fiche reste locale.`);
@@ -284,6 +295,11 @@ export default function App() {
 
     const personObj = people.find((p) => p.id === personId);
     const personName = personObj ? getFullName(personObj) : 'Membre';
+
+    if (!currentUser) {
+      notify(`Portrait de ${personName} sauvegardé localement sur cet appareil.`);
+      return;
+    }
 
     try {
       const savedRecord = await savePersonPhotoToFirestore({
@@ -386,10 +402,28 @@ export default function App() {
         <div className="flex items-center gap-2.5 shrink-0">
           {/* Subtle Firebase Cloud Sync Status */}
           <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
-            <span className="flex items-center gap-1.5 text-[#4D7A58] font-medium">
-              <span className="h-2 w-2 rounded-full bg-[#4D7A58]" />
-              <CloudCheck className="h-3.5 w-3.5" />
-              <span>{cloudStatus === 'disponible' ? 'Photos connectées' : cloudStatus === 'cache' ? 'Photos en cache' : cloudStatus === 'indisponible' ? 'Photos indisponibles' : 'Connexion photos…'}</span>
+            <span className="flex items-center gap-1.5 font-medium">
+              <span className={`h-2 w-2 rounded-full ${
+                cloudStatus === 'disponible'
+                  ? 'bg-[#4D7A58]'
+                  : cloudStatus === 'cache'
+                  ? 'bg-[#A37B42]'
+                  : cloudStatus === 'non-connecté'
+                  ? 'bg-[#8C7A65]'
+                  : 'bg-[#A8A29E]'
+              }`} />
+              <CloudCheck className={`h-3.5 w-3.5 ${cloudStatus === 'disponible' ? 'text-[#4D7A58]' : 'text-[#8C7A65]'}`} />
+              <span className={cloudStatus === 'disponible' ? 'text-[#4D7A58]' : 'text-[#6E665C]'}>
+                {cloudStatus === 'disponible'
+                  ? 'Photos connectées'
+                  : cloudStatus === 'cache'
+                  ? 'Photos en cache'
+                  : cloudStatus === 'indisponible'
+                  ? 'Photos indisponibles'
+                  : cloudStatus === 'non-connecté'
+                  ? 'Mode local'
+                  : 'Connexion photos…'}
+              </span>
             </span>
             <span className="text-[#D8CFC2]">·</span>
             {currentUser ? (
