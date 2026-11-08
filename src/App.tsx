@@ -147,16 +147,8 @@ export default function App() {
     return () => unsub();
   }, []);
 
-  // 3. Subscribe to real-time Cloud Photos in Firestore only when authenticated
+  // 3. Subscribe to real-time Cloud Photos in Firestore
   useEffect(() => {
-    if (!authInitialized) return;
-
-    if (!currentUser) {
-      setCloudStatus('non-connecté');
-      setPhotosMap({});
-      return;
-    }
-
     setCloudStatus('chargement');
     const unsub = subscribeToPersonPhotos(
       (cloudMap, fromCache) => {
@@ -345,11 +337,6 @@ export default function App() {
 
     const personObj = people.find((p) => p.id === personId);
     const personName = personObj ? getFullName(personObj) : 'Membre';
-
-    if (!currentUser) {
-      notify(`Portrait de ${personName} sauvegardé localement sur cet appareil.`);
-      return;
-    }
 
     try {
       const savedRecord = await savePersonPhotoToFirestore({
