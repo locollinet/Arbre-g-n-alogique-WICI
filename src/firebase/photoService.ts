@@ -9,6 +9,7 @@ import {
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
 import { OperationType, handleFirestoreError } from './errors';
+import { Person, TreeSettings } from '../data/wiciFamily';
 
 export interface PersonPhotoRecord {
   personId: string;
@@ -20,7 +21,15 @@ export interface PersonPhotoRecord {
   uploadedBy?: string;
 }
 
+export interface FamilyArchiveRecord {
+  people: Person[];
+  settings?: Partial<TreeSettings>;
+  updatedAt: string;
+}
+
 const COLLECTION_NAME = 'personPhotos';
+const ARCHIVE_COLLECTION = 'familyArchive';
+const ARCHIVE_DOC_ID = 'main';
 
 /**
  * Validates personId matches security requirements (alphanumeric, dash, underscore, max 128)
@@ -146,6 +155,86 @@ export function subscribeToPersonPhotos(
     (error) => {
       try {
         handleFirestoreError(error, OperationType.GET, COLLECTION_NAME);
+      } catch (e) {
+        if (onError && e instanceof Error) onError(e);
+      }
+    }
+  );
+}
+
+/**
+ * Strips base64 photos and undefined values from Person array so the main archive doc stays lightweight (~8KB)
+ */
+function stripPeopleForArchive(people: Person[]): Person[] {
+  return people.map((p) => {
+    const clean: Person = {
+      id: p.id,
+      first: p.first || '',
+      last: p.last || '',
+      parents: Array.isArray(p.parents) ? p.parents : [],
+    };
+    if (p.maidenName) clean.maidenName = p.maidenName;
+    if (p.birth) clean.birth = p.birth;
+    if (p.death) clean.death = p.death;
+    if (p.location) clean.location = p.location;
+    if (p.occupation) clean.occupation = p.occupation;
+    if (p.spouses && p.spouses.length > 0) clean.spouses = p.spouses;
+    if (p.notes) clean.notes = p.notes;
+    return clean;
+  });
+}
+
+/**
+ * Saves the complete family tree structure and settings to Firestore (familyArchive/main)
+ */
+export async function saveFamilyArchiveToFirestore(
+  people: Person[],
+  settings?: TreeSettings
+): Promise<FamilyArchiveRecord> {
+  const docRef = doc(db, ARCHIVE_COLLECTION, ARCHIVE_DOC_ID);
+  const record: FamilyArchiveRecord = {
+    people: stripPeopleForArchive(people),
+    updatedAt: new Date().toISOString(),
+  };
+  if (settings) {
+    record.settings = JSON.parse(JSON.stringify(settings));
+  }
+  try {
+    await setDoc(docRef, record);
+    return record;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
+  }
+}
+
+/**
+ * Real-time listener for the family tree archive in Firestore.
+ * If the document doesn't exist yet on the server, onMissing() is called so the app can seed it automatically.
+ */
+export function subscribeToFamilyArchive(
+  onUpdate: (record: FamilyArchiveRecord, fromCache: boolean) => void,
+  onMissing?: () => void,
+  onError?: (err: Error) => void
+): () => void {
+  const docRef = doc(db, ARCHIVE_COLLECTION, ARCHIVE_DOC_ID);
+  return onSnapshot(
+    docRef,
+    { includeMetadataChanges: true },
+    (snapshot) => {
+      if (!snapshot.exists()) {
+        if (!snapshot.metadata.fromCache && onMissing) {
+          onMissing();
+        }
+        return;
+      }
+      const data = snapshot.data() as FamilyArchiveRecord;
+      if (data && Array.isArray(data.people) && data.people.length > 0) {
+        onUpdate(data, snapshot.metadata.fromCache);
+      }
+    },
+    (error) => {
+      try {
+        handleFirestoreError(error, OperationType.GET, `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
       } catch (e) {
         if (onError && e instanceof Error) onError(e);
       }

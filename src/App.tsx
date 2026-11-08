@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { User } from 'firebase/auth';
 import {
   INITIAL_WICI_PEOPLE,
   DEFAULT_SETTINGS,
@@ -14,29 +13,22 @@ import { ChronicleBranchesView } from './components/ChronicleBranchesView';
 import { PersonDrawer } from './components/PersonDrawer';
 import { PhotoCropperModal, CropResult } from './components/PhotoCropperModal';
 import {
-  GitFork,
   Layers,
   Sliders,
   Smartphone,
   Network,
-  Cloud,
   CloudCheck,
-  LogIn,
-  LogOut,
-  Camera
+  UserPlus
 } from 'lucide-react';
 import { testConnection } from './firebase/firebase';
 import {
   subscribeToPersonPhotos,
   savePersonPhotoToFirestore,
   deletePersonPhotoFromFirestore,
+  subscribeToFamilyArchive,
+  saveFamilyArchiveToFirestore,
   PersonPhotoRecord
 } from './firebase/photoService';
-import {
-  signInWithGoogle,
-  signOutCurrentUser,
-  subscribeToAuth
-} from './firebase/authService';
 
 const STORAGE_PEOPLE_KEY = 'wici-archive-people-v2';
 const STORAGE_SETTINGS_KEY = 'wici-archive-settings-v2';
@@ -52,7 +44,6 @@ export default function App() {
         const parsed = JSON.parse(savedV2);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       }
-      // Also check legacy key from previous HTML file if any
       const legacy = localStorage.getItem('wici-tree-v1');
       if (legacy) {
         const parsedLegacy = JSON.parse(legacy);
@@ -83,15 +74,14 @@ export default function App() {
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [preselectedParentId, setPreselectedParentId] = useState<string | null>(null);
 
-  // Standalone Photo Cropper Atelier state (when launched from Studio or Tree)
+  // Standalone Photo Cropper Atelier state
   const [cropperPersonId, setCropperPersonId] = useState<string | null>(null);
 
-  // Firebase Cloud Auth & Data state
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
-  const [authInitialized, setAuthInitialized] = useState(false);
+  // Firebase Cloud Data state (No Auth required — direct link sharing)
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
-  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible' | 'non-connecté'>('chargement');
+  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
+  const hasSeededArchiveRef = useRef(false);
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -100,6 +90,20 @@ export default function App() {
     setToastMsg(msg);
   }, []);
 
+  // Helper to persist tree changes to Firestore in the background
+  const syncTreeToCloud = useCallback(
+    (nextPeople: Person[], nextSettings: TreeSettings) => {
+      saveFamilyArchiveToFirestore(nextPeople, nextSettings)
+        .then(() => {
+          setCloudStatus('disponible');
+        })
+        .catch((err) => {
+          console.warn('Synchronisation Firestore différée:', err);
+        });
+    },
+    []
+  );
+
   // 1. Initial connection test to Firestore on boot
   useEffect(() => {
     testConnection().catch(() => {
@@ -107,12 +111,39 @@ export default function App() {
     });
   }, []);
 
-  // 2. Subscribe to Firebase Auth state
+  // 2. Subscribe to real-time Family Archive (people + settings) in Firestore
   useEffect(() => {
-    const unsub = subscribeToAuth((user) => {
-      setCurrentUser(user);
-      setAuthInitialized(true);
-    });
+    const unsub = subscribeToFamilyArchive(
+      (archiveRecord, fromCache) => {
+        setCloudStatus(fromCache ? 'cache' : 'disponible');
+        if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
+          setPeople((prev) => {
+            // Merge cloud people with currently loaded photos
+            const prevPhotos = new Map(prev.map((p) => [p.id, p.photo]));
+            const cloudPhotos = lastCloudPhotos.current;
+            return archiveRecord.people.map((cp) => ({
+              ...cp,
+              photo: cloudPhotos[cp.id]?.photoDataUrl || prevPhotos.get(cp.id) || cp.photo,
+            }));
+          });
+        }
+        if (archiveRecord.settings) {
+          setSettings((prev) => ({ ...prev, ...archiveRecord.settings }));
+        }
+      },
+      () => {
+        // Document doesn't exist yet on Firestore: seed the database with our initial copy!
+        if (!hasSeededArchiveRef.current) {
+          hasSeededArchiveRef.current = true;
+          saveFamilyArchiveToFirestore(people, settings)
+            .then(() => setCloudStatus('disponible'))
+            .catch(() => {});
+        }
+      },
+      () => {
+        setCloudStatus('indisponible');
+      }
+    );
     return () => unsub();
   }, []);
 
@@ -157,7 +188,7 @@ export default function App() {
       }
     );
     return () => unsub();
-  }, [authInitialized, currentUser?.uid]);
+  }, []);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -165,16 +196,19 @@ export default function App() {
     return () => clearTimeout(t);
   }, [toastMsg]);
 
-  // Persist people changes
+  // Persist people changes locally (without heavy base64 strings if already in cloud to keep localStorage light)
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_PEOPLE_KEY, JSON.stringify(people));
+      const compactPeople = people.map((p) =>
+        photosMap[p.id] ? { ...p, photo: undefined } : p
+      );
+      localStorage.setItem(STORAGE_PEOPLE_KEY, JSON.stringify(compactPeople));
     } catch {
-      notify('Espace local saturé : pensez à exporter votre sauvegarde JSON dans l’onglet Paramètres.');
+      // ignore storage quota warning since Firebase holds the main copy
     }
-  }, [people, notify]);
+  }, [people, photosMap]);
 
-  // Persist settings changes
+  // Persist settings changes locally
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_SETTINGS_KEY, JSON.stringify(settings));
@@ -199,11 +233,16 @@ export default function App() {
       : '#FAF8F5';
 
   const handleUpdateSettings = (partial: Partial<TreeSettings>) => {
-    setSettings((prev) => ({ ...prev, ...partial }));
+    setSettings((prev) => {
+      const next = { ...prev, ...partial };
+      syncTreeToCloud(people, next);
+      return next;
+    });
   };
 
   const handleResetSettings = () => {
     setSettings(DEFAULT_SETTINGS);
+    syncTreeToCloud(people, DEFAULT_SETTINGS);
     notify('Réglages esthétiques restaurés aux valeurs par défaut.');
   };
 
@@ -220,13 +259,13 @@ export default function App() {
   };
 
   const handleSavePerson = (updated: Person, childIdsToAttach?: string[]) => {
+    const isNewPerson = !people.some((p) => p.id === updated.id);
     setPeople((prev) => {
       const exists = prev.some((p) => p.id === updated.id);
       let nextList = exists
         ? prev.map((p) => (p.id === updated.id ? updated : p))
         : [...prev, updated];
 
-      // If childIdsToAttach was provided from the PersonDrawer, synchronize parent links on children
       if (childIdsToAttach) {
         const childSet = new Set(childIdsToAttach);
         nextList = nextList.map((p) => {
@@ -242,30 +281,35 @@ export default function App() {
         });
       }
 
+      syncTreeToCloud(nextList, settings);
       return nextList;
     });
 
     setSelectedPersonId(updated.id);
-    notify(`Fiche de ${getFullName(updated)} enregistrée dans ce navigateur.`);
-    if (!people.some(p => p.id === updated.id) && updated.photo && currentUser) {
-      void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo }).then(record => {
-        setPhotosMap(prev => ({ ...prev, [updated.id]: record }));
-        notify(`Portrait de ${getFullName(updated)} envoyé dans le cloud ; sa fiche reste locale.`);
-      }).catch(() => notify(`Fiche et portrait de ${getFullName(updated)} enregistrés uniquement sur cet appareil.`));
+    notify(`Fiche de ${getFullName(updated)} enregistrée et synchronisée.`);
+
+    if (isNewPerson && updated.photo) {
+      void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo })
+        .then((record) => {
+          setPhotosMap((prev) => ({ ...prev, [updated.id]: record }));
+        })
+        .catch(() => {});
     }
   };
 
   const handleDeletePerson = (id: string) => {
     const target = people.find((p) => p.id === id);
-    setPeople((prev) =>
-      prev
+    setPeople((prev) => {
+      const nextList = prev
         .filter((p) => p.id !== id)
         .map((p) => ({
           ...p,
           parents: (p.parents || []).filter((pid) => pid !== id),
           spouses: (p.spouses || []).filter((sid) => sid !== id),
-        }))
-    );
+        }));
+      syncTreeToCloud(nextList, settings);
+      return nextList;
+    });
     if (focusBranch === id) setFocusBranch('all');
     if (target) {
       notify(`${getFullName(target)} a été retiré(e) de l’arbre.`);
@@ -273,22 +317,28 @@ export default function App() {
   };
 
   const handleImportData = (importedPeople: Person[], importedSettings?: Partial<TreeSettings>) => {
+    const nextSettings = importedSettings ? { ...settings, ...importedSettings } : settings;
     setPeople(importedPeople);
     if (importedSettings) {
-      setSettings((prev) => ({ ...prev, ...importedSettings }));
+      setSettings(nextSettings);
     }
     setFocusBranch('all');
+    syncTreeToCloud(importedPeople, nextSettings);
   };
 
   const handleRestoreInitialData = () => {
-    setPeople(INITIAL_WICI_PEOPLE);
+    const withPhotos = INITIAL_WICI_PEOPLE.map((p) => ({
+      ...p,
+      photo: photosMap[p.id]?.photoDataUrl || p.photo,
+    }));
+    setPeople(withPhotos);
     setSettings(DEFAULT_SETTINGS);
     setFocusBranch('all');
-    notify('Arbre initial de la famille Wici restauré.');
+    syncTreeToCloud(withPhotos, DEFAULT_SETTINGS);
+    notify('Arbre initial de la famille Wici restauré et synchronisé.');
   };
 
   const handleSavePersonPhoto = async (personId: string, result: CropResult) => {
-    // 1. Optimistic update in memory
     setPeople((prev) =>
       prev.map((p) => (p.id === personId ? { ...p, photo: result.dataUrl } : p))
     );
@@ -311,62 +361,52 @@ export default function App() {
       });
 
       setPhotosMap((prev) => ({ ...prev, [personId]: savedRecord }));
-      notify(`Portrait de ${personName} synchronisé dans le Cloud Firebase.`);
+      notify(`Portrait de ${personName} enregistré dans le Cloud Firebase.`);
     } catch (err: unknown) {
-      console.warn('Sauvegarde Cloud Firestore différée ou restreinte:', err);
-      notify(`Portrait de ${personName} sauvegardé localement dans l’arbre.`);
+      console.warn('Sauvegarde Cloud Firestore différée:', err);
+      notify(`Portrait de ${personName} enregistré localement.`);
     }
   };
 
   const handleRemovePersonPhoto = async (personId: string) => {
-    if (!currentUser) throw new Error('Connexion nécessaire pour supprimer le portrait partagé.');
     await deletePersonPhotoFromFirestore(personId);
-    setPhotosMap(prev => { const next = { ...prev }; delete next[personId]; return next; });
-  };
-
-  const handleGoogleLogin = async () => {
-    try {
-      const user = await signInWithGoogle();
-      notify(`Connecté avec ${user.displayName || user.email}. Les fiches restent locales ; seules les photos peuvent être partagées.`);
-    } catch (e) {
-      notify('Connexion Google annulée ou indisponible.');
-    }
-  };
-
-  const handleGoogleLogout = async () => {
-    try {
-      await signOutCurrentUser();
-      notify('Session fermée. Vos données locales restent disponibles.');
-    } catch {
-      // ignore
-    }
+    setPhotosMap((prev) => {
+      const next = { ...prev };
+      delete next[personId];
+      return next;
+    });
   };
 
   return (
     <div
-      className="min-h-screen flex flex-col text-[#1C1917] transition-colors duration-200 pb-16 md:pb-0"
+      className="min-h-screen flex flex-col text-[#1C1917] transition-colors duration-200 pb-14 md:pb-0"
       style={{ backgroundColor: canvasBg }}
     >
-      {/* Top Bar - Responsive Header with Brand & Mode Switch */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-4 px-4 sm:px-6 lg:px-10 h-14 sm:h-16 bg-white/95 backdrop-blur-md border-b border-[#E6DFD3]">
-        {/* Zone 1: Brand title */}
-        <a
-          href="#arbre"
-          onClick={(e) => {
-            e.preventDefault();
-            setActiveTab('tree');
-          }}
-          className="font-serif text-lg sm:text-2xl font-medium tracking-tight text-[#1C1917] whitespace-nowrap shrink-0"
-        >
-          {settings.familyName}
-        </a>
+      {/* Top Bar - Clean, Responsive Header */}
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 px-4 sm:px-6 lg:px-8 h-14 bg-white/95 backdrop-blur-md border-b border-[#E6DFD3]">
+        {/* Zone 1: Brand title + member count */}
+        <div className="flex items-baseline gap-3 shrink-0">
+          <a
+            href="#arbre"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveTab('tree');
+            }}
+            className="font-serif text-xl sm:text-2xl font-medium tracking-tight text-[#1C1917] whitespace-nowrap"
+          >
+            {settings.familyName}
+          </a>
+          <span className="hidden xl:inline-block text-xs text-[#8C7A65] font-mono">
+            {people.length} membres · 5 générations
+          </span>
+        </div>
 
-        {/* Zone 2: Desktop Navigation Links (hidden on mobile, handled by bottom bar) */}
-        <nav className="hidden md:flex items-center gap-6 lg:gap-8 text-sm font-medium text-[#6E665C]">
+        {/* Zone 2: Desktop Navigation Links */}
+        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-[#6E665C]">
           <button
             type="button"
             onClick={() => setActiveTab('tree')}
-            className={`py-5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+            className={`py-4 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'tree'
                 ? 'border-[#1C1917] text-[#1C1917]'
                 : 'border-transparent hover:text-[#1C1917]'
@@ -377,7 +417,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab('branches')}
-            className={`py-5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+            className={`py-4 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'branches'
                 ? 'border-[#1C1917] text-[#1C1917]'
                 : 'border-transparent hover:text-[#1C1917]'
@@ -388,90 +428,42 @@ export default function App() {
           <button
             type="button"
             onClick={() => setActiveTab('settings')}
-            className={`py-5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+            className={`py-4 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
               activeTab === 'settings'
                 ? 'border-[#1C1917] text-[#1C1917]'
                 : 'border-transparent hover:text-[#1C1917]'
             }`}
           >
-            Atelier & Paramètres
+            Fiches & Options
           </button>
         </nav>
 
-        {/* Zone 3: Cloud Sync, Mobile View Toggle & Action */}
-        <div className="flex items-center gap-2.5 shrink-0">
-          {/* Subtle Firebase Cloud Sync Status */}
-          <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
-            <span className="flex items-center gap-1.5 font-medium">
-              <span className={`h-2 w-2 rounded-full ${
-                cloudStatus === 'disponible'
-                  ? 'bg-[#4D7A58]'
-                  : cloudStatus === 'cache'
-                  ? 'bg-[#A37B42]'
-                  : cloudStatus === 'non-connecté'
-                  ? 'bg-[#8C7A65]'
-                  : 'bg-[#A8A29E]'
-              }`} />
-              <CloudCheck className={`h-3.5 w-3.5 ${cloudStatus === 'disponible' ? 'text-[#4D7A58]' : 'text-[#8C7A65]'}`} />
-              <span className={cloudStatus === 'disponible' ? 'text-[#4D7A58]' : 'text-[#6E665C]'}>
-                {cloudStatus === 'disponible'
-                  ? 'Photos connectées'
-                  : cloudStatus === 'cache'
-                  ? 'Photos en cache'
-                  : cloudStatus === 'indisponible'
-                  ? 'Photos indisponibles'
-                  : cloudStatus === 'non-connecté'
-                  ? 'Mode local'
-                  : 'Connexion photos…'}
-              </span>
+        {/* Zone 3: Cloud Sync Pill, Mobile View Toggle & Add Person */}
+        <div className="flex items-center gap-2 shrink-0">
+          <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
+            <span
+              className={`h-2 w-2 rounded-full ${
+                cloudStatus === 'indisponible' ? 'bg-[#C87D55]' : 'bg-[#4D7A58]'
+              }`}
+            />
+            <CloudCheck className="h-3.5 w-3.5 text-[#4D7A58]" />
+            <span className="text-[#4D7A58] font-medium">
+              {cloudStatus === 'disponible'
+                ? 'Synchronisé Firebase'
+                : cloudStatus === 'cache'
+                ? 'Synchronisé (cache)'
+                : cloudStatus === 'indisponible'
+                ? 'Sauvegarde locale'
+                : 'Connexion…'}
             </span>
-            <span className="text-[#D8CFC2]">·</span>
-            {currentUser ? (
-              <div className="flex items-center gap-1.5 text-[#1C1917]">
-                <span className="max-w-[130px] truncate text-[11px] font-sans">
-                  {currentUser.displayName || currentUser.email}
-                </span>
-                <button
-                  type="button"
-                  onClick={handleGoogleLogout}
-                  title="Déconnexion Google"
-                  className="text-[#8C7A65] hover:text-[#992B15] transition-colors p-0.5"
-                >
-                  <LogOut className="h-3 w-3" />
-                </button>
-              </div>
-            ) : (
-              <button
-                type="button"
-                onClick={handleGoogleLogin}
-                className="text-[11px] font-medium text-[#8C7355] hover:text-[#1C1917] flex items-center gap-1 transition-colors"
-                title="Se connecter avec Google pour persister les photos"
-              >
-                <LogIn className="h-3 w-3" />
-                <span>Connexion</span>
-              </button>
-            )}
           </div>
 
           {activeTab === 'tree' && (
-            <div className="md:hidden inline-flex items-center bg-[#FAF8F5] border border-[#E0D7C9] p-0.5 rounded-xs">
-              <button
-                type="button"
-                onClick={() => setMobileViewMode('touch')}
-                className={`min-h-[34px] px-2.5 text-xs font-medium rounded-2xs flex items-center gap-1 ${
-                  mobileViewMode === 'touch'
-                    ? 'bg-white text-[#1C1917] shadow-2xs font-semibold'
-                    : 'text-[#6E665C]'
-                }`}
-                title="Affichage optimisé tactile"
-              >
-                <Smartphone className="h-3.5 w-3.5" />
-                <span>Explorer</span>
-              </button>
+            <div className="md:hidden inline-flex items-center bg-[#FAF8F5] border border-[#E0D7C9] p-0.5 rounded-full">
               <button
                 type="button"
                 onClick={() => setMobileViewMode('canvas')}
-                className={`min-h-[34px] px-2.5 text-xs font-medium rounded-2xs flex items-center gap-1 ${
+                className={`min-h-[32px] px-2.5 text-xs font-medium rounded-full flex items-center gap-1 ${
                   mobileViewMode === 'canvas'
                     ? 'bg-white text-[#1C1917] shadow-2xs font-semibold'
                     : 'text-[#6E665C]'
@@ -481,16 +473,31 @@ export default function App() {
                 <Network className="h-3.5 w-3.5" />
                 <span>Arbre</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setMobileViewMode('touch')}
+                className={`min-h-[32px] px-2.5 text-xs font-medium rounded-full flex items-center gap-1 ${
+                  mobileViewMode === 'touch'
+                    ? 'bg-white text-[#1C1917] shadow-2xs font-semibold'
+                    : 'text-[#6E665C]'
+                }`}
+                title="Navigation par foyer"
+              >
+                <Smartphone className="h-3.5 w-3.5" />
+                <span>Foyer</span>
+              </button>
             </div>
           )}
 
           <button
             type="button"
             onClick={() => handleOpenCreatePerson()}
-            className="hidden sm:inline-flex min-h-[40px] px-4 py-2 text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 hover:opacity-90 items-center justify-center"
+            className="inline-flex min-h-[36px] px-3 sm:px-4 py-1.5 rounded-full text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 hover:opacity-90 items-center justify-center gap-1.5"
             style={{ backgroundColor: accentColor }}
           >
-            + Nouveau membre
+            <UserPlus className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Nouveau membre</span>
+            <span className="sm:hidden">Ajouter</span>
           </button>
         </div>
       </header>
@@ -499,8 +506,7 @@ export default function App() {
       <main className="flex-1 flex flex-col">
         {activeTab === 'tree' && (
           <>
-            {/* On mobile: show touch-first list by default, allow toggle to canvas */}
-            <div className="md:hidden">
+            <div className="md:hidden flex-1 flex flex-col">
               {mobileViewMode === 'touch' ? (
                 <MobileGenealogyView
                   people={people}
@@ -525,7 +531,6 @@ export default function App() {
               )}
             </div>
 
-            {/* On desktop: show full interactive canvas */}
             <div className="hidden md:flex flex-col flex-1">
               <TreeCanvasView
                 people={people}
@@ -571,18 +576,15 @@ export default function App() {
             onNotify={notify}
             onOpenPhotoCropper={(personId) => setCropperPersonId(personId)}
             photosMap={photosMap}
-            currentUser={currentUser}
-            onGoogleLogin={handleGoogleLogin}
-            onGoogleLogout={handleGoogleLogout}
             accentColor={accentColor}
           />
         )}
       </main>
 
-      {/* Ergonomic Fixed Bottom Tab Bar for Mobile Touch (Pattern 1) */}
+      {/* Ergonomic Fixed Bottom Tab Bar for Mobile Touch */}
       <nav
         aria-label="Navigation principale mobile"
-        className="fixed bottom-0 left-0 right-0 z-40 md:hidden bg-white/95 backdrop-blur-md border-t border-[#E6DFD3] grid grid-cols-3 h-16 px-2 safe-area-pb"
+        className="fixed bottom-0 left-0 right-0 z-40 md:hidden bg-white/95 backdrop-blur-md border-t border-[#E6DFD3] grid grid-cols-3 h-14 px-2 safe-area-pb"
       >
         <button
           type="button"
@@ -591,8 +593,8 @@ export default function App() {
             activeTab === 'tree' ? 'text-[#1C1917]' : 'text-[#8C7A65]'
           }`}
         >
-          <Network className="h-5 w-5" style={activeTab === 'tree' ? { color: accentColor } : undefined} />
-          <span className={`text-[10px] mt-1 font-medium tracking-tight ${activeTab === 'tree' ? 'font-semibold' : ''}`}>
+          <Network className="h-4.5 w-4.5" style={activeTab === 'tree' ? { color: accentColor } : undefined} />
+          <span className={`text-[10px] mt-0.5 font-medium tracking-tight ${activeTab === 'tree' ? 'font-semibold' : ''}`}>
             L’Arbre
           </span>
         </button>
@@ -604,8 +606,8 @@ export default function App() {
             activeTab === 'branches' ? 'text-[#1C1917]' : 'text-[#8C7A65]'
           }`}
         >
-          <Layers className="h-5 w-5" style={activeTab === 'branches' ? { color: accentColor } : undefined} />
-          <span className={`text-[10px] mt-1 font-medium tracking-tight ${activeTab === 'branches' ? 'font-semibold' : ''}`}>
+          <Layers className="h-4.5 w-4.5" style={activeTab === 'branches' ? { color: accentColor } : undefined} />
+          <span className={`text-[10px] mt-0.5 font-medium tracking-tight ${activeTab === 'branches' ? 'font-semibold' : ''}`}>
             Branches
           </span>
         </button>
@@ -617,46 +619,12 @@ export default function App() {
             activeTab === 'settings' ? 'text-[#1C1917]' : 'text-[#8C7A65]'
           }`}
         >
-          <Sliders className="h-5 w-5" style={activeTab === 'settings' ? { color: accentColor } : undefined} />
-          <span className={`text-[10px] mt-1 font-medium tracking-tight ${activeTab === 'settings' ? 'font-semibold' : ''}`}>
-            Paramètres
+          <Sliders className="h-4.5 w-4.5" style={activeTab === 'settings' ? { color: accentColor } : undefined} />
+          <span className={`text-[10px] mt-0.5 font-medium tracking-tight ${activeTab === 'settings' ? 'font-semibold' : ''}`}>
+            Fiches & Photos
           </span>
         </button>
       </nav>
-
-      {/* Quiet Archival Footer (visible on desktop or scrolled end) */}
-      <footer className="border-t border-[#E6DFD3] bg-white px-6 lg:px-10 py-5 hidden md:block">
-        <div className="max-w-[1600px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[#787167]">
-          <p className="font-serif italic text-sm text-[#4A453E]">
-            {settings.familyName} — Cinq générations d’histoire familiale préservées.
-          </p>
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => setActiveTab('tree')}
-              className="hover:text-[#1C1917] transition-colors"
-            >
-              Vue de l’arbre
-            </button>
-            <span>·</span>
-            <button
-              type="button"
-              onClick={() => setActiveTab('branches')}
-              className="hover:text-[#1C1917] transition-colors"
-            >
-              Les 5 branches
-            </button>
-            <span>·</span>
-            <button
-              type="button"
-              onClick={() => setActiveTab('settings')}
-              className="hover:text-[#1C1917] transition-colors"
-            >
-              Paramétrage & Sauvegarde
-            </button>
-          </div>
-        </div>
-      </footer>
 
       {/* Slide-Over Person Portrait & Edit Drawer */}
       <PersonDrawer
@@ -680,12 +648,14 @@ export default function App() {
         accentColor={accentColor}
       />
 
-      {/* Standalone Photo Cropper Atelier (e.g. from Studio Gallery or direct link) */}
+      {/* Standalone Photo Cropper Atelier */}
       {cropperPersonId && (
         <PhotoCropperModal
           isOpen={!!cropperPersonId}
           person={people.find((p) => p.id === cropperPersonId) || (people[0] as Person)}
           initialImageSrc={people.find((p) => p.id === cropperPersonId)?.photo}
+          initialFilter={photosMap[cropperPersonId]?.filter || 'none'}
+          initialShape={photosMap[cropperPersonId]?.shape || 'circle'}
           accentColor={accentColor}
           onClose={() => setCropperPersonId(null)}
           onSave={async (result) => {
@@ -699,7 +669,7 @@ export default function App() {
       {toastMsg && (
         <div
           role="status"
-          className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1C1917] text-[#FAF8F5] px-5 py-2.5 text-xs font-medium shadow-lg border border-[#3D3832]"
+          className="fixed bottom-16 md:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1C1917] text-[#FAF8F5] px-5 py-2.5 rounded-full text-xs font-medium shadow-lg border border-[#3D3832]"
         >
           {toastMsg}
         </div>

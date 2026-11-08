@@ -8,18 +8,16 @@ import {
   Sliders,
   Check,
   Sparkles,
-  Cloud,
   CloudCheck,
   AlertCircle,
   Eye,
   RefreshCw,
   Move,
   Camera,
-  LogIn
+  Maximize2,
+  Minimize2
 } from 'lucide-react';
 import { Person, getFullName, getLifeDates } from '../data/wiciFamily';
-import { auth } from '../firebase/firebase';
-import { signInWithGoogle } from '../firebase/authService';
 
 export interface CropResult {
   dataUrl: string;
@@ -33,6 +31,8 @@ interface PhotoCropperModalProps {
   isOpen: boolean;
   person: Person;
   initialImageSrc?: string;
+  initialFilter?: 'none' | 'sepia' | 'bw' | 'warm';
+  initialShape?: 'circle' | 'oval' | 'portrait' | 'square';
   accentColor: string;
   onClose: () => void;
   onSave: (result: CropResult) => Promise<void> | void;
@@ -41,10 +41,14 @@ interface PhotoCropperModalProps {
 type ShapeType = 'circle' | 'oval' | 'portrait' | 'square';
 type FilterType = 'none' | 'sepia' | 'bw' | 'warm';
 
+const OUTPUT_DIM = 380;
+
 export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   isOpen,
   person,
   initialImageSrc,
+  initialFilter = 'none',
+  initialShape = 'circle',
   accentColor,
   onClose,
   onSave,
@@ -52,14 +56,14 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const [imageSrc, setImageSrc] = useState<string | null>(initialImageSrc || null);
   const [loadedImage, setLoadedImage] = useState<HTMLImageElement | null>(null);
 
-  // Transform states
+  // Transform states: zoom = 1 means the entire image fits comfortably inside the frame
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
-  const [rotation, setRotation] = useState<number>(0); // in degrees (-45 to 45 fine tilt or 90 steps)
+  const [rotation, setRotation] = useState<number>(0);
 
   // Style states
-  const [shape, setShape] = useState<ShapeType>('circle');
-  const [filter, setFilter] = useState<FilterType>('sepia');
+  const [shape, setShape] = useState<ShapeType>(initialShape);
+  const [filter, setFilter] = useState<FilterType>(initialFilter);
   const [caption, setCaption] = useState<string>('');
 
   // Status states
@@ -69,17 +73,17 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [previewDataUrl, setPreviewDataUrl] = useState<string>('');
   const [estimatedSizeKb, setEstimatedSizeKb] = useState<number>(0);
-  const [isAuthPromptOpen, setIsAuthPromptOpen] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pinchRef = useRef<{ dist: number; startZoom: number } | null>(null);
 
   // Initialize or reset when opened
   useEffect(() => {
     if (isOpen) {
       setErrorMessage(null);
-      setShape('circle');
-      setFilter('sepia');
+      setShape(initialShape || 'circle');
+      setFilter(initialFilter || 'none');
       setCaption('');
       setPan({ x: 0, y: 0 });
       setZoom(1);
@@ -93,7 +97,17 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
         setImageSrc(null);
       }
     }
-  }, [isOpen, initialImageSrc, person]);
+  }, [isOpen, initialImageSrc, initialFilter, initialShape, person]);
+
+  // Compute normalized baseScale so that at zoom = 1 (100%), even a 4000px photo fits entirely inside the 380px frame
+  const getBaseScale = useCallback((img: HTMLImageElement) => {
+    const maxDim = Math.max(img.width, img.height, 1);
+    // If it's already a 380x380 cropped image, keep 1:1 at zoom=1
+    if (img.width === OUTPUT_DIM && img.height === OUTPUT_DIM) {
+      return 1;
+    }
+    return (OUTPUT_DIM * 0.92) / maxDim;
+  }, []);
 
   // Load Image element when imageSrc changes
   useEffect(() => {
@@ -105,11 +119,8 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       setLoadedImage(img);
-      // Auto-fit initial zoom so face fills the crop zone nicely
-      const minDim = Math.min(img.width, img.height);
-      const targetSize = 280;
-      const initialScale = Math.max(1, targetSize / minDim);
-      setZoom(Number(initialScale.toFixed(2)));
+      // Start at zoom = 1.0 (entire photo visible, never over-zoomed!)
+      setZoom(1);
       setPan({ x: 0, y: 0 });
       setRotation(0);
     };
@@ -145,47 +156,46 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     if (!loadedImage || !canvasRef.current) return '';
 
     const canvas = canvasRef.current;
-    const outputDim = 380; // High resolution for crisp Retina display
-    canvas.width = outputDim;
-    canvas.height = outputDim;
+    canvas.width = OUTPUT_DIM;
+    canvas.height = OUTPUT_DIM;
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
-    ctx.clearRect(0, 0, outputDim, outputDim);
+    ctx.clearRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
     ctx.save();
 
     // 1. Clip path based on chosen shape
-    const center = outputDim / 2;
+    const center = OUTPUT_DIM / 2;
     ctx.beginPath();
     if (shape === 'circle') {
-      ctx.arc(center, center, outputDim * 0.46, 0, Math.PI * 2);
+      ctx.arc(center, center, OUTPUT_DIM * 0.46, 0, Math.PI * 2);
     } else if (shape === 'oval') {
-      ctx.ellipse(center, center, outputDim * 0.38, outputDim * 0.46, 0, 0, Math.PI * 2);
+      ctx.ellipse(center, center, OUTPUT_DIM * 0.38, OUTPUT_DIM * 0.46, 0, 0, Math.PI * 2);
     } else if (shape === 'portrait') {
-      const w = outputDim * 0.74;
-      const h = outputDim * 0.92;
-      const x = (outputDim - w) / 2;
-      const y = (outputDim - h) / 2;
-      const r = 24;
-      ctx.roundRect(x, y, w, h, r);
+      const w = OUTPUT_DIM * 0.74;
+      const h = OUTPUT_DIM * 0.92;
+      const x = (OUTPUT_DIM - w) / 2;
+      const y = (OUTPUT_DIM - h) / 2;
+      ctx.roundRect(x, y, w, h, 24);
     } else {
-      // square with elegant rounded corners
-      const s = outputDim * 0.88;
-      const x = (outputDim - s) / 2;
-      const r = 20;
-      ctx.roundRect(x, x, s, s, r);
+      const s = OUTPUT_DIM * 0.88;
+      const x = (OUTPUT_DIM - s) / 2;
+      ctx.roundRect(x, x, s, s, 20);
     }
     ctx.closePath();
     ctx.clip();
 
     // 2. Background base fill
     ctx.fillStyle = '#F5F2EB';
-    ctx.fillRect(0, 0, outputDim, outputDim);
+    ctx.fillRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
 
-    // 3. Transformations: Center -> Pan -> Rotate -> Scale
+    // 3. Transformations: Center -> Pan -> Rotate -> Normalized Scale * User Zoom
+    const baseScale = getBaseScale(loadedImage);
+    const effectiveScale = baseScale * zoom;
+
     ctx.translate(center + pan.x, center + pan.y);
     ctx.rotate((rotation * Math.PI) / 180);
-    ctx.scale(zoom, zoom);
+    ctx.scale(effectiveScale, effectiveScale);
 
     // Draw the image centered
     const imgX = -loadedImage.width / 2;
@@ -196,8 +206,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
 
     // 4. Apply Filters
     if (filter !== 'none') {
-      // Re-apply filter via Canvas composition
-      const imgData = ctx.getImageData(0, 0, outputDim, outputDim);
+      const imgData = ctx.getImageData(0, 0, OUTPUT_DIM, OUTPUT_DIM);
       const d = imgData.data;
 
       for (let i = 0; i < d.length; i += 4) {
@@ -208,7 +217,6 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
         if (a === 0) continue;
 
         if (filter === 'sepia') {
-          // Warm archival sepia formula
           const tr = 0.393 * r + 0.769 * g + 0.189 * b;
           const tg = 0.349 * r + 0.686 * g + 0.168 * b;
           const tb = 0.272 * r + 0.534 * g + 0.131 * b;
@@ -216,16 +224,13 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
           d[i + 1] = Math.min(255, tg * 0.98);
           d[i + 2] = Math.min(255, tb * 0.88);
         } else if (filter === 'bw') {
-          // Classic film grain silver gelatin B&W
           const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-          // slight contrast curve
           const contrast = (gray - 128) * 1.15 + 128;
           const clamped = Math.max(0, Math.min(255, contrast));
           d[i] = clamped;
           d[i + 1] = clamped;
           d[i + 2] = clamped;
         } else if (filter === 'warm') {
-          // Golden hour archival amber
           d[i] = Math.min(255, r * 1.08 + 8);
           d[i + 1] = Math.min(255, g * 1.02 + 4);
           d[i + 2] = Math.max(0, b * 0.92 - 4);
@@ -237,26 +242,26 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     // 5. Draw decorative archival cameo border
     ctx.save();
     ctx.lineWidth = 3;
-    ctx.strokeStyle = '#B89F7C'; // Warm bronze/gold heirloom trim
+    ctx.strokeStyle = '#B89F7C';
     if (shape === 'circle') {
       ctx.beginPath();
-      ctx.arc(center, center, outputDim * 0.46, 0, Math.PI * 2);
+      ctx.arc(center, center, OUTPUT_DIM * 0.46, 0, Math.PI * 2);
       ctx.stroke();
     } else if (shape === 'oval') {
       ctx.beginPath();
-      ctx.ellipse(center, center, outputDim * 0.38, outputDim * 0.46, 0, 0, Math.PI * 2);
+      ctx.ellipse(center, center, OUTPUT_DIM * 0.38, OUTPUT_DIM * 0.46, 0, 0, Math.PI * 2);
       ctx.stroke();
     } else if (shape === 'portrait') {
-      const w = outputDim * 0.74;
-      const h = outputDim * 0.92;
-      const x = (outputDim - w) / 2;
-      const y = (outputDim - h) / 2;
+      const w = OUTPUT_DIM * 0.74;
+      const h = OUTPUT_DIM * 0.92;
+      const x = (OUTPUT_DIM - w) / 2;
+      const y = (OUTPUT_DIM - h) / 2;
       ctx.beginPath();
       ctx.roundRect(x, y, w, h, 24);
       ctx.stroke();
     } else {
-      const s = outputDim * 0.88;
-      const x = (outputDim - s) / 2;
+      const s = OUTPUT_DIM * 0.88;
+      const x = (OUTPUT_DIM - s) / 2;
       ctx.beginPath();
       ctx.roundRect(x, x, s, s, 20);
       ctx.stroke();
@@ -267,9 +272,8 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     setPreviewDataUrl(dataUrl);
     setEstimatedSizeKb(Math.round(dataUrl.length / 1024));
     return dataUrl;
-  }, [loadedImage, shape, filter, zoom, pan, rotation]);
+  }, [loadedImage, shape, filter, zoom, pan, rotation, getBaseScale]);
 
-  // Update canvas on parameter change
   useEffect(() => {
     if (loadedImage) {
       renderCropCanvas();
@@ -278,8 +282,8 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
 
   // Drag interaction for positioning the image
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!loadedImage) return;
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    if (!loadedImage || e.pointerType === 'touch') return;
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     setIsDragging(true);
     setDragStart({
       x: e.clientX,
@@ -290,7 +294,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!isDragging || !dragStart) return;
+    if (!isDragging || !dragStart || e.pointerType === 'touch') return;
     const dx = e.clientX - dragStart.x;
     const dy = e.clientY - dragStart.y;
     setPan({
@@ -302,7 +306,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (isDragging) {
       try {
-        (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
       } catch {
         // ignore
       }
@@ -311,23 +315,80 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   };
 
+  // Touch drag + 2-finger pinch zoom inside cropper
+  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!loadedImage) return;
+    if (e.touches.length === 1) {
+      const t = e.touches[0];
+      setIsDragging(true);
+      setDragStart({
+        x: t.clientX,
+        y: t.clientY,
+        panX: pan.x,
+        panY: pan.y,
+      });
+      pinchRef.current = null;
+    } else if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[1].clientX - e.touches[0].clientX,
+        e.touches[1].clientY - e.touches[0].clientY
+      );
+      pinchRef.current = { dist, startZoom: zoom };
+      setIsDragging(false);
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (!loadedImage) return;
+    if (e.touches.length === 2 && pinchRef.current) {
+      const dist = Math.hypot(
+        e.touches[1].clientX - e.touches[0].clientX,
+        e.touches[1].clientY - e.touches[0].clientY
+      );
+      const ratio = dist / Math.max(1, pinchRef.current.dist);
+      const next = Math.min(5, Math.max(0.15, Number((pinchRef.current.startZoom * ratio).toFixed(2))));
+      setZoom(next);
+    } else if (e.touches.length === 1 && isDragging && dragStart) {
+      const t = e.touches[0];
+      setPan({
+        x: dragStart.panX + (t.clientX - dragStart.x),
+        y: dragStart.panY + (t.clientY - dragStart.y),
+      });
+    }
+  };
+
+  const handleTouchEnd = () => {
+    setIsDragging(false);
+    setDragStart(null);
+    pinchRef.current = null;
+  };
+
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     if (!loadedImage) return;
-    const delta = e.deltaY > 0 ? -0.08 : 0.08;
-    setZoom((z) => Math.min(3.5, Math.max(0.4, Number((z + delta).toFixed(2)))));
+    const factor = e.deltaY > 0 ? 0.92 : 1.08;
+    setZoom((z) => Math.min(5, Math.max(0.15, Number((z * factor).toFixed(2)))));
   };
 
-  // Quick 90 degree rotation
   const handleRotate90 = () => {
     setRotation((r) => (r + 90) % 360);
   };
 
-  // Reset framing
-  const handleReset = () => {
+  // Fit entire photo inside the medallion (dezoom complete)
+  const handleFitWholePhoto = () => {
     setZoom(1);
     setPan({ x: 0, y: 0 });
     setRotation(0);
+  };
+
+  // Fill the medallion without margins
+  const handleFillFrame = () => {
+    if (!loadedImage) return;
+    const maxDim = Math.max(loadedImage.width, loadedImage.height, 1);
+    const minDim = Math.min(loadedImage.width, loadedImage.height, 1);
+    const fillZoom = Number(((maxDim / minDim) * 1.04).toFixed(2));
+    setZoom(Math.min(5, Math.max(0.15, fillZoom)));
+    setPan({ x: 0, y: 0 });
   };
 
   // Save handler with Firebase Cloud storage
@@ -353,55 +414,33 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     } catch (err: unknown) {
       console.error('Erreur enregistrement photo:', err);
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('permission-denied') || msg.includes('PERMISSION_DENIED')) {
-        setErrorMessage(
-          'Permissions insuffisantes. Connectez-vous avec Google pour enregistrer le portrait dans Firebase.'
-        );
-        setIsAuthPromptOpen(true);
-      } else {
-        setErrorMessage(msg || "Erreur lors de l'enregistrement de la photo.");
-      }
+      setErrorMessage(msg || "Erreur lors de l'enregistrement de la photo.");
     } finally {
       setIsSaving(false);
-    }
-  };
-
-  const handleGoogleLogin = async () => {
-    try {
-      setErrorMessage(null);
-      await signInWithGoogle();
-      setIsAuthPromptOpen(false);
-      // Retry save automatically
-      await handleSaveAndSync();
-    } catch (e) {
-      setErrorMessage("Échec de l'authentification Google.");
     }
   };
 
   if (!isOpen) return null;
 
   const datesText = getLifeDates(person);
-  const currentUser = auth.currentUser;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#1C1917]/70 backdrop-blur-xs p-3 sm:p-6 overflow-y-auto">
-      {/* Backdrop click */}
       <div className="fixed inset-0" onClick={onClose} aria-label="Fermer" />
 
-      {/* Modal Card */}
-      <div className="relative z-10 w-full max-w-4xl bg-[#FAF8F5] text-[#1C1917] border border-[#E6DFD3] shadow-2xl overflow-hidden flex flex-col my-auto max-h-[92vh]">
+      <div className="relative z-10 w-full max-w-4xl bg-[#FAF8F5] text-[#1C1917] border border-[#E6DFD3] rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[92vh]">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 bg-white border-b border-[#E6DFD3] shrink-0">
+        <div className="flex items-center justify-between px-5 sm:px-6 py-4 bg-white border-b border-[#E6DFD3] shrink-0">
           <div className="flex items-center gap-3">
             <div
-              className="h-9 w-9 rounded-full flex items-center justify-center text-white"
+              className="h-9 w-9 rounded-full flex items-center justify-center text-white shrink-0"
               style={{ backgroundColor: accentColor }}
             >
               <Sparkles className="h-4 w-4" />
             </div>
             <div>
               <p className="text-[11px] uppercase tracking-[0.2em] text-[#8C7A65] font-medium">
-                Atelier Photographique & Archives Cloud
+                Atelier Photo Familial
               </p>
               <h2 className="font-serif text-xl sm:text-2xl font-normal text-[#1C1917]">
                 Portrait de {getFullName(person)}
@@ -417,57 +456,38 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
           </button>
         </div>
 
-        {/* Auth prompt banner if not logged in */}
-        {!currentUser && (
-          <div className="bg-[#F8F5EE] border-b border-[#E8DEC9] px-6 py-2.5 flex items-center justify-between gap-3 text-xs text-[#6B5E4F] shrink-0">
-            <div className="flex items-center gap-2">
-              <Cloud className="h-4 w-4 text-[#8C7A65]" />
-              <span>
-                <strong>Stockage Cloud Firebase actif :</strong> Connectez-vous avec Google pour sauvegarder vos photos de façon pérenne sur le cloud sans alourdir le code.
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={handleGoogleLogin}
-              className="inline-flex items-center gap-1.5 px-3 py-1 bg-white border border-[#D5C7B4] hover:border-[#8C7355] text-xs font-medium text-[#1C1917] rounded-xs shadow-2xs whitespace-nowrap transition-colors"
-            >
-              <LogIn className="h-3.5 w-3.5 text-[#8C7A65]" />
-              <span>Connexion Google</span>
-            </button>
-          </div>
-        )}
-
         {/* Content body */}
-        <div className="flex-1 overflow-y-auto p-5 sm:p-7">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-7">
           {errorMessage && (
-            <div className="mb-5 p-3.5 bg-[#FDF2F0] border border-[#E6B8B0] text-xs text-[#8C2D19] flex items-center gap-2">
+            <div className="mb-5 p-3.5 bg-[#FDF2F0] border border-[#E6B8B0] text-xs text-[#8C2D19] flex items-center gap-2 rounded-lg">
               <AlertCircle className="h-4 w-4 shrink-0" />
               <span>{errorMessage}</span>
             </div>
           )}
 
           {!imageSrc ? (
-            /* Upload Zone if no image is loaded */
-            <div className="border-2 border-dashed border-[#D8CFC2] bg-white p-10 text-center flex flex-col items-center justify-center gap-4 hover:border-[#8C7355] transition-colors cursor-pointer"
-                 onClick={() => fileInputRef.current?.click()}>
+            <div
+              className="border-2 border-dashed border-[#D8CFC2] bg-white rounded-xl p-10 text-center flex flex-col items-center justify-center gap-4 hover:border-[#8C7355] transition-colors cursor-pointer"
+              onClick={() => fileInputRef.current?.click()}
+            >
               <div className="h-16 w-16 rounded-full bg-[#FAF8F5] border border-[#E2DAD0] flex items-center justify-center text-[#8C7A65]">
                 <Camera className="h-8 w-8" />
               </div>
               <div className="max-w-md">
                 <h3 className="font-serif text-xl font-normal text-[#1C1917]">
-                  Ajouter un portrait photographique
+                  Choisir une photo pour {person.first}
                 </h3>
                 <p className="text-xs text-[#7A7266] mt-1.5">
-                  Glissez-déposez une photo d'époque ou cliquez pour parcourir vos fichiers (JPG, PNG, WebP).
+                  Sélectionnez une photo depuis votre téléphone ou votre ordinateur (JPG, PNG, WebP).
                 </p>
                 <p className="text-[11px] text-[#9A9184] mt-1">
-                  La photo sera automatiquement recadrée et optimisée pour l'arbre généalogique.
+                  Elle sera automatiquement adaptée et partagée sur l’arbre familial.
                 </p>
               </div>
 
               <button
                 type="button"
-                className="mt-2 inline-flex items-center gap-2 px-5 py-2.5 text-xs font-medium text-white transition-opacity hover:opacity-90"
+                className="mt-2 inline-flex items-center gap-2 px-5 py-2.5 text-xs font-medium text-white rounded-lg transition-opacity hover:opacity-90"
                 style={{ backgroundColor: accentColor }}
               >
                 <Upload className="h-4 w-4" />
@@ -475,31 +495,39 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
               </button>
             </div>
           ) : (
-            /* Active Cropper Workspace */
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-7">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               {/* Left Column: Interactive Canvas & Framing (7 cols) */}
               <div className="lg:col-span-7 flex flex-col gap-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-medium text-[#575047] uppercase tracking-wider flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-[#575047] flex items-center gap-1.5">
                     <Move className="h-3.5 w-3.5 text-[#8C7A65]" />
-                    Cadre & Positionnement (Glisser pour ajuster)
+                    Glissez l’image et dézoomez librement (jusqu’à 15 %)
                   </span>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={handleReset}
-                      className="text-xs text-[#8C7A65] hover:text-[#1C1917] flex items-center gap-1 transition-colors"
-                      title="Réinitialiser le zoom et la position"
+                      onClick={handleFitWholePhoto}
+                      className="px-2.5 py-1 text-xs bg-white border border-[#D8CFC2] hover:border-[#8C7355] text-[#1C1917] rounded-md flex items-center gap-1 transition-colors"
+                      title="Dézoomer pour voir toute la photo en entier"
                     >
-                      <RefreshCw className="h-3 w-3" />
-                      <span>Réinitialiser</span>
+                      <Minimize2 className="h-3 w-3 text-[#8C7A65]" />
+                      <span>Photo entière</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleFillFrame}
+                      className="px-2.5 py-1 text-xs bg-white border border-[#D8CFC2] hover:border-[#8C7355] text-[#1C1917] rounded-md flex items-center gap-1 transition-colors"
+                      title="Ajuster pour remplir le médaillon"
+                    >
+                      <Maximize2 className="h-3 w-3 text-[#8C7A65]" />
+                      <span>Remplir</span>
                     </button>
                     <button
                       type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      className="text-xs text-[#8C7A65] hover:text-[#1C1917] underline transition-colors ml-2"
+                      className="text-xs text-[#8C7A65] hover:text-[#1C1917] underline transition-colors ml-1"
                     >
-                      Autre fichier
+                      Changer de photo
                     </button>
                   </div>
                 </div>
@@ -510,13 +538,16 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                   onPointerMove={handlePointerMove}
                   onPointerUp={handlePointerUp}
                   onPointerCancel={handlePointerUp}
+                  onTouchStart={handleTouchStart}
+                  onTouchMove={handleTouchMove}
+                  onTouchEnd={handleTouchEnd}
+                  onTouchCancel={handleTouchEnd}
                   onWheel={handleWheel}
-                  className={`relative w-full aspect-square max-w-[380px] mx-auto bg-[#F2EDE4] border border-[#D5C7B4] shadow-inner overflow-hidden select-none touch-none flex items-center justify-center ${
+                  className={`relative w-full aspect-square max-w-[340px] sm:max-w-[380px] mx-auto bg-[#F2EDE4] border border-[#D5C7B4] rounded-xl shadow-inner overflow-hidden select-none touch-none flex items-center justify-center ${
                     isDragging ? 'cursor-grabbing' : 'cursor-grab'
                   }`}
                   style={{
-                    backgroundImage:
-                      'radial-gradient(#D5C7B4 1.5px, transparent 1.5px)',
+                    backgroundImage: 'radial-gradient(#D5C7B4 1.5px, transparent 1.5px)',
                     backgroundSize: '20px 20px',
                   }}
                 >
@@ -525,70 +556,49 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                     className="w-full h-full object-contain pointer-events-none drop-shadow-md"
                   />
 
-                  {/* Visual Guide Overlay (Corner crosshairs) */}
                   <div className="absolute inset-0 pointer-events-none border border-[#B89F7C]/20" />
-                  <div className="absolute top-2 left-2 text-[10px] font-mono text-[#8C7A65]/70 pointer-events-none">
-                    Zoom: {(zoom * 100).toFixed(0)}%
+                  <div className="absolute top-2.5 left-3 bg-white/85 backdrop-blur-xs px-2 py-0.5 rounded text-[11px] font-mono text-[#575047] pointer-events-none">
+                    Zoom : {Math.round(zoom * 100)}%
                   </div>
                 </div>
 
-                {/* Framing Shape Selector */}
-                <div>
-                  <label className="block text-xs font-medium text-[#575047] mb-1.5">
-                    Forme du médaillon dans l'arbre
-                  </label>
-                  <div className="grid grid-cols-4 gap-2">
-                    {[
-                      { id: 'circle', label: 'Médaillon Rond', desc: 'Classique d’orfèvre' },
-                      { id: 'oval', label: 'Camée Ovale', desc: 'Portrait XIXe-XXe' },
-                      { id: 'portrait', label: 'Format 3:4', desc: 'Studio d’époque' },
-                      { id: 'square', label: 'Carré Doux', desc: 'Épuré & moderne' },
-                    ].map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => setShape(item.id as ShapeType)}
-                        className={`p-2.5 border text-center transition-all ${
-                          shape === item.id
-                            ? 'bg-white border-[#8C7355] shadow-xs'
-                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
-                        }`}
-                      >
-                        <span className="block text-xs font-medium text-[#1C1917]">
-                          {item.label}
-                        </span>
-                        <span className="block text-[10px] text-[#8C7A65] mt-0.5">
-                          {item.desc}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Transform Sliders: Zoom & Tilt */}
-                <div className="space-y-3 bg-white p-3.5 border border-[#E6DFD3]">
-                  {/* Zoom Slider */}
-                  <div className="flex items-center gap-3">
-                    <ZoomOut className="h-4 w-4 text-[#8C7A65] shrink-0" />
+                {/* Transform Sliders: Wide Zoom (15% to 500%) & Tilt */}
+                <div className="space-y-3 bg-white p-4 border border-[#E6DFD3] rounded-xl">
+                  <div className="flex items-center gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => setZoom((z) => Math.max(0.15, Number((z - 0.1).toFixed(2))))}
+                      className="p-1.5 border border-[#E0D7C9] rounded hover:bg-[#FAF8F5] text-[#575047]"
+                      title="Dézoomer"
+                    >
+                      <ZoomOut className="h-4 w-4" />
+                    </button>
                     <input
                       type="range"
-                      min="0.5"
-                      max="3"
-                      step="0.05"
+                      min="0.15"
+                      max="4"
+                      step="0.02"
                       value={zoom}
                       onChange={(e) => setZoom(parseFloat(e.target.value))}
                       className="w-full accent-[#8C7355] cursor-pointer"
                     />
-                    <ZoomIn className="h-4 w-4 text-[#8C7A65] shrink-0" />
+                    <button
+                      type="button"
+                      onClick={() => setZoom((z) => Math.min(5, Number((z + 0.1).toFixed(2))))}
+                      className="p-1.5 border border-[#E0D7C9] rounded hover:bg-[#FAF8F5] text-[#575047]"
+                      title="Zoomer"
+                    >
+                      <ZoomIn className="h-4 w-4" />
+                    </button>
                     <span className="text-xs font-mono tabular-nums text-[#6E665C] w-12 text-right">
                       {Math.round(zoom * 100)}%
                     </span>
                   </div>
 
                   {/* Tilt Slider + 90° Rotate */}
-                  <div className="flex items-center gap-3 pt-1 border-t border-[#F0EAE1]">
+                  <div className="flex items-center gap-3 pt-2 border-t border-[#F0EAE1]">
                     <span className="text-[11px] text-[#6E665C] whitespace-nowrap">
-                      Inclinaison :
+                      Rotation :
                     </span>
                     <input
                       type="range"
@@ -605,7 +615,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                     <button
                       type="button"
                       onClick={handleRotate90}
-                      className="p-1.5 border border-[#D8CFC2] hover:bg-[#F5F2EB] rounded-xs text-[#1C1917] transition-colors"
+                      className="p-1.5 border border-[#D8CFC2] hover:bg-[#F5F2EB] rounded text-[#1C1917] transition-colors"
                       title="Pivoter de 90°"
                     >
                       <RotateCw className="h-3.5 w-3.5" />
@@ -614,26 +624,54 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                 </div>
               </div>
 
-              {/* Right Column: Filters, Live In-Situ Preview & Sync (5 cols) */}
-              <div className="lg:col-span-5 flex flex-col gap-5">
-                {/* Vintage Photographic Tone Filters */}
+              {/* Right Column: Filters, Shape & Live In-Situ Preview (5 cols) */}
+              <div className="lg:col-span-5 flex flex-col gap-4">
+                {/* Framing Shape Selector */}
                 <div>
-                  <label className="block text-xs font-medium text-[#575047] mb-2 flex items-center gap-1.5">
-                    <Sliders className="h-3.5 w-3.5 text-[#8C7A65]" />
-                    Tonalité & Filtre d'Époque
+                  <label className="block text-xs font-medium text-[#575047] mb-1.5">
+                    Forme du cadre
                   </label>
                   <div className="grid grid-cols-2 gap-2">
                     {[
-                      { id: 'sepia', label: 'Sépia d’Archives', desc: 'Chaleur vintage' },
-                      { id: 'bw', label: 'Argentique N&B', desc: 'Contraste d’antan' },
-                      { id: 'warm', label: 'Lumière Dorée', desc: 'Patine douce' },
-                      { id: 'none', label: 'Couleur Naturelle', desc: 'Sans retouche' },
+                      { id: 'circle', label: 'Médaillon Rond' },
+                      { id: 'oval', label: 'Camée Ovale' },
+                      { id: 'portrait', label: 'Format Portrait' },
+                      { id: 'square', label: 'Carré Doux' },
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setShape(item.id as ShapeType)}
+                        className={`p-2.5 border rounded-lg text-center transition-all ${
+                          shape === item.id
+                            ? 'bg-white border-[#8C7355] shadow-xs font-medium text-[#1C1917]'
+                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
+                        }`}
+                      >
+                        <span className="block text-xs">{item.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Vintage Photographic Tone Filters */}
+                <div>
+                  <label className="block text-xs font-medium text-[#575047] mb-1.5 flex items-center gap-1.5">
+                    <Sliders className="h-3.5 w-3.5 text-[#8C7A65]" />
+                    Couleur & Filtre
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: 'none', label: 'Couleur Naturelle', desc: 'Photo originale' },
+                      { id: 'sepia', label: 'Sépia d’Archives', desc: 'Chaleur ancienne' },
+                      { id: 'bw', label: 'Noir & Blanc', desc: 'Argentique doux' },
+                      { id: 'warm', label: 'Lumière Dorée', desc: 'Patine chaude' },
                     ].map((f) => (
                       <button
                         key={f.id}
                         type="button"
                         onClick={() => setFilter(f.id as FilterType)}
-                        className={`p-2 border text-left transition-all ${
+                        className={`p-2.5 border rounded-lg text-left transition-all ${
                           filter === f.id
                             ? 'bg-white border-[#8C7355] shadow-xs ring-1 ring-[#8C7355]/40'
                             : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
@@ -650,32 +688,15 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                   </div>
                 </div>
 
-                {/* Optional Caption / Date */}
-                <div>
-                  <label className="block text-xs font-medium text-[#575047] mb-1">
-                    Légende ou date de la prise de vue (facultatif)
-                  </label>
-                  <input
-                    type="text"
-                    value={caption}
-                    onChange={(e) => setCaption(e.target.value)}
-                    placeholder="Ex: Photo de mariage, 1938"
-                    className="w-full h-9 px-3 bg-white border border-[#D8CFC2] text-xs text-[#1C1917] focus:outline-none focus:border-[#8C7355]"
-                    maxLength={100}
-                  />
-                </div>
-
                 {/* Live In-Situ Tree Node Preview */}
-                <div className="bg-[#FAF8F5] border border-[#E2DAD0] p-4">
-                  <span className="text-[11px] uppercase tracking-[0.18em] text-[#8C7A65] font-medium block mb-3 flex items-center gap-1.5">
+                <div className="bg-white border border-[#E2DAD0] rounded-xl p-4">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-[#8C7A65] font-medium block mb-3 flex items-center gap-1.5">
                     <Eye className="h-3.5 w-3.5" />
-                    Aperçu en situation dans l'arbre
+                    Aperçu sur sa carte dans l’arbre
                   </span>
 
-                  {/* Render exact tree card style */}
-                  <div className="bg-white border border-[#E2DAD0] shadow-sm p-3.5 flex items-center gap-3.5 max-w-[280px] mx-auto transition-transform">
-                    {/* The cropped avatar */}
-                    <div className="h-12 w-12 rounded-full border border-[#DFD6C7] bg-[#F5F1E9] flex items-center justify-center overflow-hidden shrink-0 shadow-2xs">
+                  <div className="bg-[#FAF8F5] border border-[#E2DAD0] rounded-lg shadow-xs p-3.5 flex items-center gap-3.5 max-w-[260px] mx-auto">
+                    <div className="h-12 w-12 rounded-full border border-[#DFD6C7] bg-[#F5F1E9] flex items-center justify-center overflow-hidden shrink-0">
                       {previewDataUrl ? (
                         <img
                           src={previewDataUrl}
@@ -688,7 +709,6 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                         </span>
                       )}
                     </div>
-                    {/* The typography */}
                     <div className="min-w-0 flex-1">
                       <p className="font-serif text-[17px] font-medium text-[#1C1917] leading-tight truncate">
                         {person.first}
@@ -706,15 +726,12 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                     </div>
                   </div>
 
-                  {/* Footnote on size and performance */}
-                  <div className="mt-3.5 pt-3 border-t border-[#EAE3D6] flex items-center justify-between text-[11px] text-[#7A7266]">
+                  <div className="mt-3 pt-2.5 border-t border-[#EAE3D6] flex items-center justify-between text-[11px] text-[#7A7266]">
                     <span className="flex items-center gap-1.5">
                       <CloudCheck className="h-3.5 w-3.5 text-[#5B8266]" />
-                      Optimisé pour Firestore
+                      Synchronisation Firebase directe
                     </span>
-                    <span className="font-mono tabular-nums">
-                      ~{estimatedSizeKb} Ko
-                    </span>
+                    <span className="font-mono tabular-nums">~{estimatedSizeKb} Ko</span>
                   </div>
                 </div>
               </div>
@@ -723,22 +740,18 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="px-6 py-4 bg-white border-t border-[#E6DFD3] flex flex-wrap items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center gap-2 text-xs text-[#6E665C]">
-            <Cloud className="h-4 w-4 text-[#8C7A65]" />
-            <span>
-              {currentUser
-                ? `Connecté en tant que ${currentUser.displayName || currentUser.email}`
-                : 'Mode local / Connexion Google recommandée pour le cloud'}
-            </span>
-          </div>
+        <div className="px-5 sm:px-6 py-4 bg-white border-t border-[#E6DFD3] flex flex-wrap items-center justify-between gap-3 shrink-0">
+          <span className="text-xs text-[#6E665C] flex items-center gap-1.5">
+            <CloudCheck className="h-4 w-4 text-[#4D7A58]" />
+            Partagé automatiquement avec toute la famille
+          </span>
 
           <div className="flex items-center gap-3">
             <button
               type="button"
               onClick={onClose}
               disabled={isSaving}
-              className="px-4 py-2 text-xs font-medium border border-[#D8CFC2] hover:bg-[#F5F2EB] text-[#1C1917] transition-colors"
+              className="px-4 py-2 text-xs font-medium border border-[#D8CFC2] rounded-lg hover:bg-[#F5F2EB] text-[#1C1917] transition-colors"
             >
               Annuler
             </button>
@@ -748,18 +761,18 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                 type="button"
                 onClick={handleSaveAndSync}
                 disabled={isSaving || !loadedImage}
-                className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-50 shadow-xs"
+                className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white rounded-lg transition-opacity hover:opacity-90 disabled:opacity-50 shadow-xs"
                 style={{ backgroundColor: accentColor }}
               >
                 {isSaving ? (
                   <>
                     <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    <span>Sauvegarde Firestore…</span>
+                    <span>Enregistrement…</span>
                   </>
                 ) : (
                   <>
                     <Check className="h-3.5 w-3.5" />
-                    <span>Enregistrer le portrait</span>
+                    <span>Enregistrer la photo</span>
                   </>
                 )}
               </button>
@@ -767,7 +780,6 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
           </div>
         </div>
 
-        {/* Hidden native file input */}
         <input
           ref={fileInputRef}
           type="file"

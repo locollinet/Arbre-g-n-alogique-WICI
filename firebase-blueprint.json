@@ -40,17 +40,44 @@
         },
         "uploadedBy": {
           "type": "string",
-          "description": "Identifiant Firebase Auth de l'auteur de l'envoi",
+          "description": "Identifiant optionnel de l'auteur de l'envoi",
           "maxLength": 128
         }
       },
       "required": ["personId", "photoDataUrl", "updatedAt"]
+    },
+    "FamilyArchive": {
+      "title": "FamilyArchive",
+      "description": "Archive partagée de l'arbre généalogique familial (membres et réglages d'affichage)",
+      "type": "object",
+      "properties": {
+        "people": {
+          "type": "array",
+          "description": "Liste des membres de l'arbre généalogique",
+          "minItems": 1,
+          "maxItems": 500
+        },
+        "settings": {
+          "type": "object",
+          "description": "Paramètres visuels et de mise en page de l'arbre"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Horodatage ISO de la dernière mise à jour",
+          "maxLength": 64
+        }
+      },
+      "required": ["people", "updatedAt"]
     }
   },
   "firestore": {
     "/personPhotos/{personId}": {
       "schema": "PersonPhoto",
       "description": "Collection racine stockant les portraits de chaque membre de l'arbre généalogique indexés par personId"
+    },
+    "/familyArchive/{docId}": {
+      "schema": "FamilyArchive",
+      "description": "Collection racine stockant l'arbre généalogique partagé en temps réel (document 'wici')"
     }
   }
 }

@@ -596,52 +596,21 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
             </div>
           </div>
 
-          {/* Cloud Auth Status Card */}
+          {/* Cloud Sync Status Card */}
           <div className="bg-white border border-[#E6DFD3] p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div className="flex items-start sm:items-center gap-3">
-              <div className="h-10 w-10 rounded-full bg-[#FAF8F5] border border-[#E2DAD0] flex items-center justify-center text-[#8C7A65] shrink-0">
-                <Cloud className="h-5 w-5" />
+              <div className="h-10 w-10 rounded-full bg-[#EEF5F0] border border-[#CDE3D2] flex items-center justify-center text-[#4D7A58] shrink-0">
+                <CloudCheck className="h-5 w-5" />
               </div>
               <div>
-                <p className="text-xs font-medium text-[#1C1917]">
-                  {currentUser ? (
-                    <span className="text-[#3D6946] flex items-center gap-1.5">
-                      <span className="h-2 w-2 rounded-full bg-[#4D7A58]" />
-                      Connecté avec Google ({currentUser.displayName || currentUser.email})
-                    </span>
-                  ) : (
-                    <span>Mode Visiteur / Connexion Google Recommandée</span>
-                  )}
+                <p className="text-xs font-medium text-[#1C1917] flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-[#4D7A58]" />
+                  <span>Synchronisation Cloud Firebase active (Accès direct par lien)</span>
                 </p>
                 <p className="text-xs text-[#7A7266] mt-0.5">
-                  {currentUser
-                    ? 'Les portraits ne sont partagés qu’après confirmation de l’enregistrement. Les fiches restent dans ce navigateur.'
-                    : 'Connectez-vous avec un compte autorisé pour accéder aux portraits partagés.'}
+                  Toute personne disposant du lien peut enrichir les fiches et ajouter des portraits pour toute la famille, sans connexion requise.
                 </p>
               </div>
-            </div>
-
-            <div className="shrink-0">
-              {currentUser ? (
-                <button
-                  type="button"
-                  onClick={onGoogleLogout}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D8CFC2] hover:bg-[#F5F2EB] text-[#6E665C] transition-colors"
-                >
-                  <LogOut className="h-3.5 w-3.5" />
-                  <span>Se déconnecter</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={onGoogleLogin}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white transition-opacity hover:opacity-90 shadow-xs"
-                  style={{ backgroundColor: accentColor }}
-                >
-                  <LogIn className="h-3.5 w-3.5" />
-                  <span>Connexion Google</span>
-                </button>
-              )}
             </div>
           </div>
 

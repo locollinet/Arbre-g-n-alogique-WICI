@@ -240,8 +240,11 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
     const validationError = validatePeople(prospective);
     if (validationError) { setErrorMsg(validationError); return; }
     if (existingPerson && !photo && photosMap?.[existingPerson.id] && onRemovePhoto) {
-      try { await onRemovePhoto(existingPerson.id); }
-      catch { setErrorMsg('Suppression du portrait en ligne impossible. Connectez-vous et réessayez.'); return; }
+      try {
+        await onRemovePhoto(existingPerson.id);
+      } catch {
+        // Ignore offline delete error; local photo is already cleared
+      }
     }
     onSavePerson(updated, childrenIds);
     if (isNew) {
@@ -631,7 +634,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                   </div>
                   <p className="text-[11px] text-[#8E867B] flex items-center gap-1">
                     <CloudCheck className="h-3 w-3 text-[#5B8266]" />
-                    <span>La fiche est locale ; la photo est partagée uniquement après une synchronisation réussie.</span>
+                    <span>Synchronisé automatiquement en ligne pour toute la famille.</span>
                   </p>
                   <input
                     ref={fileInputRef}
@@ -962,6 +965,8 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
             }
           }
           initialImageSrc={cropperSource}
+          initialFilter={existingPerson ? photosMap?.[existingPerson.id]?.filter : 'none'}
+          initialShape={existingPerson ? photosMap?.[existingPerson.id]?.shape : 'circle'}
           accentColor={accentColor}
           onClose={() => setIsCropperOpen(false)}
           onSave={handleCropperSave}

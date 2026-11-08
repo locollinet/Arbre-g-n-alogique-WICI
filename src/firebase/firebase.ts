@@ -1,7 +1,15 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import exampleConfig from '../../firebase-applet-config.example.json';
+
+const localConfigs = import.meta.glob('../../firebase-applet-config.json', {
+  eager: true,
+  import: 'default',
+}) as Record<string, typeof exampleConfig>;
+
+const firebaseConfig =
+  localConfigs['../../firebase-applet-config.json'] || exampleConfig;
 
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 

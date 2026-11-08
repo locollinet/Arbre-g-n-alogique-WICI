@@ -51,3 +51,12 @@ test('un conjoint sans enfants ne disparaît pas de l’arbre exporté', () => {
   assert.ok([...layout.nodes.map(n => n.id), ...layout.partners.map(n => n.person.id)].includes('conjoint-test'));
   assert.ok(buildPosterSvg(people, DEFAULT_SETTINGS).svg.includes('Conjoint Test'));
 });
+
+test('l’arbre vertical empile les fratries terminales pour rester compact et lisible en entier', () => {
+  const layout = computeTreeLayout(INITIAL_WICI_PEOPLE, 'all', new Set(), DEFAULT_SETTINGS);
+  assert.ok(layout.width < 3400, `La largeur de l'arbre (${layout.width}px) doit être compacte (< 3400px)`);
+  const louis = layout.nodes.find(n => n.id === 'louis')!;
+  const jeanne = layout.nodes.find(n => n.id === 'jeanne')!;
+  assert.equal(louis.x, jeanne.x);
+  assert.ok(jeanne.y > louis.y);
+});
