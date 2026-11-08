@@ -166,10 +166,9 @@ export function computeTreeLayout(
       if (allKidsHaveOtherPrimary) {
         coParentIds.add(p.id);
       }
-    } else if ((p.spouses || []).some((sid) => activeSet.has(sid))) {
-      // Childless spouse attached to an existing member
-      coParentIds.add(p.id);
     }
+    // A childless spouse cannot be placed on a child-union stem: keep them
+    // as a root rather than silently dropping them from the whole-tree view.
   }
 
   // Assign each child to its primary tree parent
