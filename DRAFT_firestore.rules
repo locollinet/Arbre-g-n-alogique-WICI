@@ -1,62 +1,42 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // 1. Global Safety Net: Catch-all Default Deny
-    match /{document=**} {
-      allow read, write: if false;
+    // Membership is provisioned manually in Firebase Console or via the Admin SDK.
+    // No client can grant itself access. See README before deploying these rules.
+    function memberPath() {
+      return /databases/$(database)/documents/familyAccess/$(request.auth.uid);
     }
-
-    // Security Primitives & Helpers
-    function isSignedIn() {
-      return request.auth != null;
+    function isMember() {
+      return request.auth != null && exists(memberPath()) &&
+        get(memberPath()).data.role in ['viewer', 'editor', 'admin'];
     }
-
+    function isEditor() {
+      return request.auth != null && exists(memberPath()) &&
+        get(memberPath()).data.role in ['editor', 'admin'];
+    }
     function isValidId(id) {
       return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
-
-    function incoming() {
-      return request.resource.data;
-    }
-
-    function existing() {
-      return resource.data;
-    }
-
-    function isValidPersonPhoto(data, targetPersonId) {
+    function validPhoto(data, id) {
       return data.keys().hasAll(['personId', 'photoDataUrl', 'updatedAt'])
         && data.keys().hasOnly(['personId', 'photoDataUrl', 'updatedAt', 'shape', 'filter', 'caption', 'uploadedBy'])
-        && data.personId is string
-        && data.personId == targetPersonId
-        && isValidId(data.personId)
-        && data.photoDataUrl is string
-        && data.photoDataUrl.size() >= 10
-        && data.photoDataUrl.size() <= 500000
-        && data.updatedAt is string
-        && data.updatedAt.size() <= 64
+        && data.personId == id && isValidId(id)
+        && data.photoDataUrl is string && data.photoDataUrl.size() >= 10 && data.photoDataUrl.size() <= 500000
+        && data.updatedAt is string && data.updatedAt.size() <= 64
         && (!('shape' in data) || (data.shape is string && data.shape.size() <= 32))
         && (!('filter' in data) || (data.filter is string && data.filter.size() <= 32))
         && (!('caption' in data) || (data.caption is string && data.caption.size() <= 256))
-        && (!('uploadedBy' in data) || (data.uploadedBy is string && data.uploadedBy == request.auth.uid));
+        && (!('uploadedBy' in data) || data.uploadedBy == request.auth.uid);
     }
-
-    // Person Photos Collection for Family Tree
+    match /familyAccess/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, write: if false;
+    }
     match /personPhotos/{personId} {
-      // Public read for archival family tree presentation
-      allow get, list: if true;
-
-      // Verified write operations
-      allow create: if isSignedIn()
-        && isValidId(personId)
-        && isValidPersonPhoto(incoming(), personId);
-
-      allow update: if isSignedIn()
-        && isValidId(personId)
-        && isValidPersonPhoto(incoming(), personId)
-        && incoming().personId == existing().personId;
-
-      allow delete: if isSignedIn()
-        && isValidId(personId);
+      allow get, list: if isMember();
+      allow create, update: if isEditor() && validPhoto(request.resource.data, personId);
+      allow delete: if isEditor() && isValidId(personId);
     }
+    match /{document=**} { allow read, write: if false; }
   }
 }

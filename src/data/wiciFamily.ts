@@ -366,7 +366,7 @@ export const INITIAL_WICI_PEOPLE: Person[] = [
   {
     id: "unknown2016",
     first: "Prénom à confirmer",
-    last: "Golay",
+    last: "",
     birth: "2016",
     parents: ["charlotte"],
     notes: "Indiqué « ? (2016) » sous Charlotte Golay dans l'arbre PDF initial."

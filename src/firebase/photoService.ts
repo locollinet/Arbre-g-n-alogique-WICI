@@ -126,12 +126,13 @@ export async function getAllPersonPhotosFromFirestore(): Promise<Record<string, 
  * Real-time listener for all person photos in the family tree
  */
 export function subscribeToPersonPhotos(
-  onUpdate: (photosMap: Record<string, PersonPhotoRecord>) => void,
+  onUpdate: (photosMap: Record<string, PersonPhotoRecord>, fromCache: boolean) => void,
   onError?: (err: Error) => void
 ): () => void {
   const colRef = collection(db, COLLECTION_NAME);
   return onSnapshot(
     colRef,
+    { includeMetadataChanges: true },
     (snapshot) => {
       const map: Record<string, PersonPhotoRecord> = {};
       snapshot.forEach((docSnap) => {
@@ -140,7 +141,7 @@ export function subscribeToPersonPhotos(
           map[item.personId] = item;
         }
       });
-      onUpdate(map);
+      onUpdate(map, snapshot.metadata.fromCache);
     },
     (error) => {
       try {

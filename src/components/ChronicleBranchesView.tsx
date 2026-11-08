@@ -34,7 +34,7 @@ export const ChronicleBranchesView: React.FC<ChronicleBranchesViewProps> = ({
   const mainBranches = BRANCH_DEFINITIONS.filter((b) => b.id !== 'all');
 
   // Group people by generation depth (0 to 4)
-  const generations = [0, 1, 2, 3, 4].map((depth) => {
+  const generations = Array.from({ length: Math.max(4, ...depthMap.values()) + 1 }, (_, depth) => {
     const members = people
       .filter((p) => (depthMap.get(p.id) ?? 0) === depth)
       .sort((a, b) => {

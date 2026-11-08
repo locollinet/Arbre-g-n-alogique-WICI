@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from 'react';
+import { ExportControls } from './ExportControls';
 import {
   ChevronRight,
   ChevronLeft,
@@ -20,6 +21,7 @@ import {
 } from 'lucide-react';
 import {
   Person,
+  TreeSettings,
   BRANCH_DEFINITIONS,
   GENERATION_LABELS,
   getFullName,
@@ -31,6 +33,7 @@ import { resolveBranchId } from '../utils/treeLayout';
 
 interface MobileGenealogyViewProps {
   people: Person[];
+  settings: TreeSettings;
   onSelectPerson: (id: string) => void;
   onAddChildFor: (parentId: string) => void;
   onSwitchToCanvas: () => void;
@@ -39,6 +42,7 @@ interface MobileGenealogyViewProps {
 
 export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
   people,
+  settings,
   onSelectPerson,
   onAddChildFor,
   onSwitchToCanvas,
@@ -130,7 +134,7 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
     map.set('aloisi', 0);
 
     let changed = true;
-    let limit = 8;
+    let limit = people.length + 1;
     while (changed && limit > 0) {
       changed = false;
       limit--;
@@ -172,7 +176,8 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
   // Grouped for generation view
   const generationsList = useMemo(() => {
     const groups: { depth: number; meta: any; members: Person[] }[] = [];
-    for (let d = 0; d <= 4; d++) {
+    const maxDepth = Math.max(0, ...Array.from(depthMap.values()));
+    for (let d = 0; d <= maxDepth; d++) {
       const members = filteredPeople
         .filter((p) => (depthMap.get(p.id) ?? 0) === d)
         .sort((a, b) => {
@@ -251,6 +256,10 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
           </button>
         </div>
 
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs text-[#6E665C]">À partager avec la famille</span>
+          <ExportControls people={people} settings={settings} />
+        </div>
         {/* Barre de recherche simple */}
         {mobileMode === 'search' && (
           <div className="relative pt-1">
@@ -369,10 +378,7 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
               </div>
             ) : (
               <div className="p-3 text-xs text-[#6E665C] bg-[#FAF8F5] border border-dashed border-[#DFD6C7] rounded-xl text-center">
-                <span className="font-serif italic font-medium">Victoria Tripel (1914–1997)</span>
-                <span className="block text-[11px] text-[#8C7A65] mt-0.5">
-                  Matriarche à l'origine de toute la lignée Wici
-                </span>
+                <span>Parents non renseignés.</span>
               </div>
             )}
           </div>
@@ -682,18 +688,6 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
         </div>
       )}
 
-      {/* Bouton d'action flottant au pouce en bas */}
-      <div className="fixed bottom-16 left-0 right-0 p-3 bg-gradient-to-t from-[#FAF8F5] via-[#FAF8F5]/90 to-transparent pointer-events-none z-20 md:hidden flex justify-center">
-        <button
-          type="button"
-          onClick={() => onAddChildFor(currentFocusId)}
-          className="pointer-events-auto shadow-lg min-h-[48px] px-6 text-sm font-medium text-white flex items-center gap-2 rounded-full active:scale-95 transition-transform"
-          style={{ backgroundColor: accentColor }}
-        >
-          <Plus className="h-4 w-4" />
-          <span>Ajouter quelqu’un dans l’arbre</span>
-        </button>
-      </div>
     </div>
   );
 };

@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
+import { ExportControls } from './ExportControls';
 import {
   ZoomIn,
   ZoomOut,
@@ -99,7 +100,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
         // Keep cards comfortably readable on initial arrival and center around Victoria / root
         targetZoom = Math.max(0.68, Math.min(1, targetZoom));
       } else {
-        targetZoom = Math.max(0.22, Math.min(1.15, targetZoom));
+        targetZoom = Math.max(0.01, Math.min(1.15, targetZoom));
       }
 
       const rootNode =
@@ -123,13 +124,23 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
       } else {
         setPan({
           x: Math.max(24, (vw - layout.width * targetZoom) / 2),
-          y: Math.max(24, (vh - layout.height * targetZoom) / 2),
+          // Keep the overview visible above the mobile bottom navigation.
+          y: vw < 640 ? 32 : Math.max(24, (vh - layout.height * targetZoom) / 2),
         });
       }
-      setZoom(Number(targetZoom.toFixed(3)));
+      setZoom(targetZoom);
     },
     [layout, focusBranch, settings.orientation]
   );
+
+  const zoomFromCenter = (target: number) => {
+    const el = containerRef.current;
+    if (!el) return;
+    const next = Math.max(0.01, Math.min(1.8, target));
+    const x = el.clientWidth / 2, y = el.clientHeight / 2;
+    setPan({ x: x - ((x - pan.x) / zoom) * next, y: y - ((y - pan.y) / zoom) * next });
+    setZoom(next);
+  };
 
   // Center on a specific person node
   const centerOnPerson = useCallback(
@@ -157,10 +168,10 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
   // Recenter when focusBranch or orientation changes
   useEffect(() => {
     const timer = requestAnimationFrame(() => {
-      fitTreeInViewport(true);
+      fitTreeInViewport(false);
     });
     return () => cancelAnimationFrame(timer);
-  }, [focusBranch, settings.orientation, settings.cardStyle]);
+  }, [focusBranch, settings.orientation, settings.cardStyle, isFullscreen]);
 
   // Pointer pan handlers
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -261,7 +272,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
       const t2 = e.touches[1];
       const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
       const ratio = dist / touchStateRef.current.initialDistance;
-      const nextZoom = Math.max(0.2, Math.min(1.8, (touchStateRef.current.initialZoom || 0.8) * ratio));
+      const nextZoom = Math.max(0.01, Math.min(1.8, (touchStateRef.current.initialZoom || 0.8) * ratio));
 
       const midX = touchStateRef.current.midX || 0;
       const midY = touchStateRef.current.midY || 0;
@@ -292,7 +303,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
       const cursorY = e.clientY - rect.top;
 
       const factor = e.deltaY < 0 ? 1.1 : 0.9;
-      const nextZoom = Math.max(0.2, Math.min(1.8, zoom * factor));
+      const nextZoom = Math.max(0.01, Math.min(1.8, zoom * factor));
 
       const worldX = (cursorX - pan.x) / zoom;
       const worldY = (cursorY - pan.y) / zoom;
@@ -386,6 +397,11 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
       <div
         key={person.id}
         data-interactive="true"
+        role="button"
+        tabIndex={0}
+        aria-label={`Voir la fiche de ${getFullName(person)}`}
+        onPointerDown={() => { hasMovedRef.current = false; }}
+        onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); onSelectPerson(person.id); } }}
         onMouseEnter={() => setHoveredPersonId(person.id)}
         onMouseLeave={() => setHoveredPersonId(null)}
         onClick={() => {
@@ -607,6 +623,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
 
           {/* Right Controls: Orientation Switch, Fold/Unfold, Search */}
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <ExportControls people={people} settings={settings} />
             {/* Orientation Segmented Switch */}
             <div className="inline-flex items-center bg-[#FAF8F5] border border-[#E6DFD3] p-0.5">
               <button
@@ -679,7 +696,8 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
                       <button
                         key={p.id}
                         type="button"
-                        onMouseDown={() => handleSelectSearchResult(p)}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => handleSelectSearchResult(p)}
                         className="w-full flex items-center justify-between px-3.5 py-2.5 text-left hover:bg-[#FAF8F5] transition-colors"
                       >
                         <span className="font-serif text-sm text-[#1C1917]">
@@ -819,6 +837,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
                   key={partner.id}
                   type="button"
                   data-interactive="true"
+                  onPointerDown={() => { hasMovedRef.current = false; }}
                   onClick={() => {
                     if (!hasMovedRef.current) onSelectPerson(p.id);
                   }}
@@ -882,7 +901,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
           >
             <button
               type="button"
-              onClick={() => setZoom((z) => Math.max(0.2, Number((z / 1.25).toFixed(2))))}
+              onClick={() => zoomFromCenter(zoom / 1.25)}
               className="h-10 w-10 sm:h-9 sm:w-9 flex items-center justify-center text-[#4A453E] hover:bg-[#FAF8F5] active:bg-[#EFECE4] transition-colors"
               title="Dézoomer"
               aria-label="Dézoomer"
@@ -891,15 +910,15 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
             </button>
             <button
               type="button"
-              onClick={() => fitTreeInViewport(true)}
+              onClick={() => zoomFromCenter(1)}
               className="px-2.5 sm:px-3 h-10 sm:h-9 text-xs font-mono tabular-nums text-[#4A453E] hover:bg-[#FAF8F5] active:bg-[#EFECE4] transition-colors whitespace-nowrap"
-              title="Ajuster à la vue de lecture"
+              title="Revenir à 100 %"
             >
               {Math.round(zoom * 100)}%
             </button>
             <button
               type="button"
-              onClick={() => setZoom((z) => Math.min(1.8, Number((z * 1.25).toFixed(2))))}
+              onClick={() => zoomFromCenter(zoom * 1.25)}
               className="h-10 w-10 sm:h-9 sm:w-9 flex items-center justify-center text-[#4A453E] hover:bg-[#FAF8F5] active:bg-[#EFECE4] transition-colors"
               title="Zoomer"
               aria-label="Zoomer"
@@ -909,10 +928,10 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
             <button
               type="button"
               onClick={() => fitTreeInViewport(false)}
-              className="hidden sm:block px-3 h-9 text-xs font-medium text-[#4A453E] hover:bg-[#FAF8F5] transition-colors whitespace-nowrap"
+              className="block px-3 h-10 sm:h-9 text-xs font-medium text-[#4A453E] hover:bg-[#FAF8F5] transition-colors whitespace-nowrap"
               title="Afficher l'arbre entier dans le cadre"
             >
-              Vue globale
+              Tout voir
             </button>
             <button
               type="button"

@@ -6,3 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+# Configuration locale injectée par AI Studio ou créée depuis l'exemple
+firebase-applet-config.json

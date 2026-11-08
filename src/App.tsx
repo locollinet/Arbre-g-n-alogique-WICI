@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { User } from 'firebase/auth';
 import {
   INITIAL_WICI_PEOPLE,
@@ -29,6 +29,7 @@ import { testConnection } from './firebase/firebase';
 import {
   subscribeToPersonPhotos,
   savePersonPhotoToFirestore,
+  deletePersonPhotoFromFirestore,
   PersonPhotoRecord
 } from './firebase/photoService';
 import {
@@ -63,7 +64,7 @@ export default function App() {
     return INITIAL_WICI_PEOPLE;
   });
 
-  const [mobileViewMode, setMobileViewMode] = useState<'touch' | 'canvas'>('touch');
+  const [mobileViewMode, setMobileViewMode] = useState<'touch' | 'canvas'>('canvas');
 
   const [settings, setSettings] = useState<TreeSettings>(() => {
     try {
@@ -88,6 +89,8 @@ export default function App() {
   // Firebase Cloud Auth & Data state
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
+  const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
+  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -114,7 +117,10 @@ export default function App() {
   // 3. Subscribe to real-time Cloud Photos in Firestore
   useEffect(() => {
     const unsub = subscribeToPersonPhotos(
-      (cloudMap) => {
+      (cloudMap, fromCache) => {
+        const previous = lastCloudPhotos.current;
+        lastCloudPhotos.current = cloudMap;
+        setCloudStatus(fromCache ? 'cache' : 'disponible');
         setPhotosMap(cloudMap);
         // Seamlessly merge cloud photos into local people state
         setPeople((prev) => {
@@ -125,17 +131,22 @@ export default function App() {
               hasDiff = true;
               return { ...p, photo: cloudPhoto };
             }
+            if (!cloudPhoto && previous[p.id] && p.photo === previous[p.id].photoDataUrl) {
+              hasDiff = true;
+              return { ...p, photo: undefined };
+            }
             return p;
           });
           return hasDiff ? next : prev;
         });
       },
       (err) => {
+        setCloudStatus('indisponible');
         console.warn('Real-time photo sync note:', err);
       }
     );
     return () => unsub();
-  }, []);
+  }, [currentUser?.uid]);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -224,7 +235,13 @@ export default function App() {
     });
 
     setSelectedPersonId(updated.id);
-    notify(`Fiche de ${getFullName(updated)} enregistrée.`);
+    notify(`Fiche de ${getFullName(updated)} enregistrée dans ce navigateur.`);
+    if (!people.some(p => p.id === updated.id) && updated.photo) {
+      void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo }).then(record => {
+        setPhotosMap(prev => ({ ...prev, [updated.id]: record }));
+        notify(`Portrait de ${getFullName(updated)} envoyé dans le cloud ; sa fiche reste locale.`);
+      }).catch(() => notify(`Fiche et portrait de ${getFullName(updated)} enregistrés uniquement sur cet appareil.`));
+    }
   };
 
   const handleDeletePerson = (id: string) => {
@@ -285,10 +302,16 @@ export default function App() {
     }
   };
 
+  const handleRemovePersonPhoto = async (personId: string) => {
+    if (!currentUser) throw new Error('Connexion nécessaire pour supprimer le portrait partagé.');
+    await deletePersonPhotoFromFirestore(personId);
+    setPhotosMap(prev => { const next = { ...prev }; delete next[personId]; return next; });
+  };
+
   const handleGoogleLogin = async () => {
     try {
       const user = await signInWithGoogle();
-      notify(`Connecté avec ${user.displayName || user.email}. Synchronisation Cloud active !`);
+      notify(`Connecté avec ${user.displayName || user.email}. Les fiches restent locales ; seules les photos peuvent être partagées.`);
     } catch (e) {
       notify('Connexion Google annulée ou indisponible.');
     }
@@ -366,7 +389,7 @@ export default function App() {
             <span className="flex items-center gap-1.5 text-[#4D7A58] font-medium">
               <span className="h-2 w-2 rounded-full bg-[#4D7A58]" />
               <CloudCheck className="h-3.5 w-3.5" />
-              <span>Cloud Firestore</span>
+              <span>{cloudStatus === 'disponible' ? 'Photos connectées' : cloudStatus === 'cache' ? 'Photos en cache' : cloudStatus === 'indisponible' ? 'Photos indisponibles' : 'Connexion photos…'}</span>
             </span>
             <span className="text-[#D8CFC2]">·</span>
             {currentUser ? (
@@ -409,7 +432,7 @@ export default function App() {
                 title="Affichage optimisé tactile"
               >
                 <Smartphone className="h-3.5 w-3.5" />
-                <span>Tactile</span>
+                <span>Explorer</span>
               </button>
               <button
                 type="button"
@@ -422,7 +445,7 @@ export default function App() {
                 title="Plan panoramique 2D"
               >
                 <Network className="h-3.5 w-3.5" />
-                <span>Plan 2D</span>
+                <span>Arbre</span>
               </button>
             </div>
           )}
@@ -447,6 +470,7 @@ export default function App() {
               {mobileViewMode === 'touch' ? (
                 <MobileGenealogyView
                   people={people}
+                  settings={settings}
                   onSelectPerson={handleOpenPerson}
                   onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
                   onSwitchToCanvas={() => setMobileViewMode('canvas')}
@@ -612,10 +636,12 @@ export default function App() {
         onSelectPerson={(id) => setSelectedPersonId(id)}
         onFocusBranch={(id) => {
           setFocusBranch(id);
+          setMobileViewMode('canvas');
           setActiveTab('tree');
         }}
         onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
         onSavePhoto={handleSavePersonPhoto}
+        onRemovePhoto={handleRemovePersonPhoto}
         photosMap={photosMap}
         accentColor={accentColor}
       />
