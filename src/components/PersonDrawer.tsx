@@ -25,7 +25,8 @@ import {
   getLifeDates,
   isPersonIncomplete
 } from '../data/wiciFamily';
-import { getDescendantsSet } from '../utils/treeLayout';
+import { getAncestorsSet, getDescendantsSet } from '../utils/treeLayout';
+import { validatePeople } from '../utils/validateFamily';
 import { PhotoCropperModal, CropResult } from './PhotoCropperModal';
 import { PersonPhotoRecord } from '../firebase/photoService';
 
@@ -41,6 +42,7 @@ interface PersonDrawerProps {
   onFocusBranch: (id: string) => void;
   onAddChildFor: (parentId: string) => void;
   onSavePhoto?: (personId: string, result: CropResult) => Promise<void> | void;
+  onRemovePhoto?: (personId: string) => Promise<void>;
   photosMap?: Record<string, PersonPhotoRecord>;
   accentColor: string;
 }
@@ -57,6 +59,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   onFocusBranch,
   onAddChildFor,
   onSavePhoto,
+  onRemovePhoto,
   photosMap,
   accentColor,
 }) => {
@@ -123,7 +126,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
       setChildrenIds(currentKids);
       setPhoto(existingPerson.photo || '');
     }
-  }, [isOpen, personId, preselectedParentId, existingPerson, isNew, people]);
+  }, [isOpen, personId, preselectedParentId]);
 
   if (!isOpen || (!existingPerson && !isNew)) return null;
 
@@ -197,15 +200,15 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   };
 
   const toggleChild = (id: string) => {
-    if (parents.includes(id)) {
-      setErrorMsg("Une personne ne peut pas être à la fois parent et enfant.");
+    if (parents.includes(id) || (existingPerson && getAncestorsSet(people, existingPerson.id).has(id))) {
+      setErrorMsg("Impossible de sélectionner un ancêtre comme enfant (boucle généalogique).");
       return;
     }
     setErrorMsg(null);
     setChildrenIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!first.trim()) {
       setErrorMsg("Le prénom est requis.");
@@ -229,6 +232,17 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
       photo: photo || undefined,
     };
 
+    const prospective = (isNew ? [...people, updated] : people.map(p => p.id === updated.id ? updated : p)).map(p => {
+      if (p.id === updated.id) return p;
+      const linked = p.parents.includes(updated.id);
+      return childrenIds.includes(p.id) && !linked ? {...p, parents: [...p.parents, updated.id]} : !childrenIds.includes(p.id) && linked ? {...p, parents: p.parents.filter(id => id !== updated.id)} : p;
+    });
+    const validationError = validatePeople(prospective);
+    if (validationError) { setErrorMsg(validationError); return; }
+    if (existingPerson && !photo && photosMap?.[existingPerson.id] && onRemovePhoto) {
+      try { await onRemovePhoto(existingPerson.id); }
+      catch { setErrorMsg('Suppression du portrait en ligne impossible. Connectez-vous et réessayez.'); return; }
+    }
     onSavePerson(updated, childrenIds);
     if (isNew) {
       onClose();
@@ -617,7 +631,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                   </div>
                   <p className="text-[11px] text-[#8E867B] flex items-center gap-1">
                     <CloudCheck className="h-3 w-3 text-[#5B8266]" />
-                    <span>Synchronisé avec Firebase Cloud sans alourdir le code source.</span>
+                    <span>La fiche est locale ; la photo est partagée uniquement après une synchronisation réussie.</span>
                   </p>
                   <input
                     ref={fileInputRef}
