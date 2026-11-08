@@ -36,6 +36,8 @@ import {
 } from '../data/wiciFamily';
 import { computeTreeLayout, buildEdgeSvgPath, resolveBranchId } from '../utils/treeLayout';
 import { PersonPhotoRecord } from '../firebase/photoService';
+import { validatePeople } from '../utils/validateFamily';
+import { ExportControls } from './ExportControls';
 
 interface StudioSettingsViewProps {
   people: Person[];
@@ -169,99 +171,21 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
     onNotify('Sauvegarde JSON exportée avec succès.');
   };
 
-  // High-Definition Printable SVG Poster Export
-  const handleExportSvgPoster = () => {
-    const fullLayout = computeTreeLayout(people, 'all', new Set(), settings);
-    const pad = 80;
-    const totalW = fullLayout.width + pad * 2;
-    const totalH = fullLayout.height + pad * 2 + 90;
-
-    const escXml = (s: string) =>
-      String(s || '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-
-    const edgesSvg = fullLayout.edges
-      .map(
-        (e) =>
-          `<path d="${buildEdgeSvgPath(
-            e,
-            settings.orientation,
-            settings.edgeStyle
-          )}" fill="none" stroke="#C5B49E" stroke-width="1.6" stroke-linecap="round"/>`
-      )
-      .join('\n');
-
-    const nodesSvg = fullLayout.nodes
-      .map((n) => {
-        const p = n.person;
-        const dates = [p.birth, p.death].filter(Boolean).join(' – ');
-        return `<g transform="translate(${n.x}, ${n.y})">
-          <rect width="${n.width}" height="${n.height}" fill="#FFFFFF" stroke="#DFD6C7" stroke-width="1.2"/>
-          <circle cx="34" cy="${n.height / 2}" r="20" fill="#F5F1E9" stroke="#DFD6C7"/>
-          <text x="34" y="${n.height / 2 + 5}" text-anchor="middle" font-family="Georgia, serif" font-size="13" fill="#7D6B57">${escXml(
-            getInitials(p)
-          )}</text>
-          <text x="66" y="${n.height / 2 - 6}" font-family="Georgia, serif" font-size="15" font-weight="500" fill="#1C1917">${escXml(
-            p.first
-          )}</text>
-          <text x="66" y="${n.height / 2 + 12}" font-family="Georgia, serif" font-size="13" fill="#4A443C">${escXml(
-            p.last
-          )}</text>
-          <text x="66" y="${n.height / 2 + 28}" font-family="monospace" font-size="10" fill="#857C70">${escXml(
-            dates
-          )}</text>
-        </g>`;
-      })
-      .join('\n');
-
-    const svgContent = `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${totalW} ${totalH}" width="${totalW}" height="${totalH}">
-  <rect width="100%" height="100%" fill="#FAF8F5"/>
-  <g transform="translate(${pad}, 55)">
-    <text x="0" y="0" font-family="Georgia, serif" font-size="11" letter-spacing="3" fill="#8C7A65">${escXml(
-      settings.subtitle.toUpperCase()
-    )}</text>
-    <text x="0" y="34" font-family="Georgia, serif" font-size="34" fill="#1C1917">${escXml(
-      settings.familyName
-    )}</text>
-  </g>
-  <g transform="translate(${pad}, ${pad + 60})">
-    ${edgesSvg}
-    ${nodesSvg}
-  </g>
-</svg>`;
-
-    const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `affiche-arbre-wici.svg`;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    onNotify('Affiche vectorielle SVG haute définition téléchargée.');
-  };
-
   // JSON Import
   const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
+      if (file.size > 30 * 1024 * 1024) throw new Error('Fichier trop volumineux.');
       const text = await file.text();
       const parsed = JSON.parse(text);
-      if (
-        !parsed ||
-        !Array.isArray(parsed.people) ||
-        !parsed.people.every((p: any) => typeof p.id === 'string' && typeof p.first === 'string')
-      ) {
-        throw new Error('Invalid format');
-      }
+      const error = validatePeople(parsed?.people);
+      if (error) throw new Error(error);
+      if (!window.confirm(`Remplacer les données de ce navigateur par ${parsed.people.length} fiches ? Exportez d’abord une sauvegarde si nécessaire.`)) return;
       onImportData(parsed.people, parsed.settings);
       onNotify(`Sauvegarde importée (${parsed.people.length} personnes).`);
-    } catch {
-      onNotify('Fichier de sauvegarde JSON invalide ou corrompu.');
+    } catch (error) {
+      onNotify(error instanceof Error ? error.message : 'Fichier de sauvegarde JSON invalide ou corrompu.');
     } finally {
       e.target.value = '';
     }
@@ -654,7 +578,7 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
                 {cloudPhotosCount} <span className="text-sm font-sans text-[#4D7A58] font-normal">synchronisées</span>
               </p>
               <p className="text-xs text-[#6E665C] mt-1">
-                Base Firestore active : les portraits sont chargés en temps réel sans alourdir le code.
+                Portraits reçus de Firestore pendant cette session, sous réserve de connexion et d’autorisations.
               </p>
             </div>
 
@@ -691,8 +615,8 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
                 </p>
                 <p className="text-xs text-[#7A7266] mt-0.5">
                   {currentUser
-                    ? 'Vos recadrages et portraits sont sauvegardés de manière permanente sur votre base de données Firestore.'
-                    : 'Pour enregistrer vos portraits directement dans le Cloud Firebase sans limite de stockage local, connectez-vous.'}
+                    ? 'Les portraits ne sont partagés qu’après confirmation de l’enregistrement. Les fiches restent dans ce navigateur.'
+                    : 'Connectez-vous avec un compte autorisé pour accéder aux portraits partagés.'}
                 </p>
               </div>
             </div>
@@ -1192,19 +1116,12 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
                 Affiche Vectorielle (.SVG)
               </h3>
               <p className="text-xs text-[#6E665C] leading-relaxed">
-                Générez une planche vectorielle haute définition de l’arbre complet des Wici, prête à être ouverte dans n’importe quel navigateur ou imprimée en grand format sans aucune perte de qualité.
+                Créez une affiche complète avec les co-parents et les portraits disponibles, en image PNG ou SVG, ou ouvrez-la pour imprimer / enregistrer en PDF.
               </p>
             </div>
 
             <div className="pt-2">
-              <button
-                type="button"
-                onClick={handleExportSvgPoster}
-                className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-medium border border-[#1C1917] bg-[#1C1917] text-white hover:bg-[#332E2A] transition-colors"
-              >
-                <FileCode className="h-4 w-4" />
-                Exporter l’affiche vectorielle (.svg)
-              </button>
+              <ExportControls people={people} settings={settings} />
             </div>
           </div>
 
