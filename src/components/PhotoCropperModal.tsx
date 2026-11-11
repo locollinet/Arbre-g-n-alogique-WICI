@@ -15,7 +15,8 @@ import {
   Move,
   Camera,
   Maximize2,
-  Minimize2
+  Minimize2,
+  Undo2
 } from 'lucide-react';
 import { Person, getFullName, getLifeDates } from '../data/wiciFamily';
 
@@ -56,7 +57,8 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const [imageSrc, setImageSrc] = useState<string | null>(initialImageSrc || null);
   const [loadedImage, setLoadedImage] = useState<HTMLImageElement | null>(null);
 
-  // Transform states: zoom = 1 means the entire image fits comfortably inside the frame
+  // Transform states
+  // zoom = 1.0 means the image fills the circular medallion (Cover)
   const [zoom, setZoom] = useState<number>(1);
   const [pan, setPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [rotation, setRotation] = useState<number>(0);
@@ -73,6 +75,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [previewDataUrl, setPreviewDataUrl] = useState<string>('');
   const [estimatedSizeKb, setEstimatedSizeKb] = useState<number>(0);
+  const [isDragOverDropZone, setIsDragOverDropZone] = useState<boolean>(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -99,59 +102,89 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   }, [isOpen, initialImageSrc, initialFilter, initialShape, person]);
 
-  // Compute normalized baseScale so that at zoom = 1 (100%), even a 4000px photo fits entirely inside the 380px frame
-  const getBaseScale = useCallback((img: HTMLImageElement) => {
-    const maxDim = Math.max(img.width, img.height, 1);
-    // If it's already a 380x380 cropped image, keep 1:1 at zoom=1
-    if (img.width === OUTPUT_DIM && img.height === OUTPUT_DIM) {
-      return 1;
-    }
-    return (OUTPUT_DIM * 0.92) / maxDim;
+  // Compute Cover Scale: scale factor so at zoom=1.0, the photo completely fills the frame
+  const getCoverScale = useCallback((img: HTMLImageElement, rot: number) => {
+    const isSideways = rot % 180 !== 0;
+    const effW = isSideways ? img.height : img.width;
+    const effH = isSideways ? img.width : img.height;
+    const minSide = Math.max(1, Math.min(effW, effH));
+    return OUTPUT_DIM / minSide;
   }, []);
 
-  // Load Image element when imageSrc changes
+  // Compute Contain Scale: scale factor so the entire photo fits without cropping
+  const getContainScale = useCallback((img: HTMLImageElement, rot: number) => {
+    const isSideways = rot % 180 !== 0;
+    const effW = isSideways ? img.height : img.width;
+    const effH = isSideways ? img.width : img.height;
+    const maxSide = Math.max(1, Math.max(effW, effH));
+    return OUTPUT_DIM / maxSide;
+  }, []);
+
+  // Load Image element safely without setting crossOrigin on data URLs
   useEffect(() => {
     if (!imageSrc) {
       setLoadedImage(null);
       return;
     }
     const img = new Image();
-    img.crossOrigin = 'anonymous';
+    // Only set crossOrigin for remote http(s) URLs, never for data: or blob:
+    if (imageSrc.startsWith('http://') || imageSrc.startsWith('https://')) {
+      img.crossOrigin = 'anonymous';
+    }
     img.onload = () => {
       setLoadedImage(img);
-      // Start at zoom = 1.0 (entire photo visible, never over-zoomed!)
       setZoom(1);
       setPan({ x: 0, y: 0 });
       setRotation(0);
+      setErrorMessage(null);
     };
     img.onerror = () => {
-      setErrorMessage("Impossible de charger l'image source.");
+      setErrorMessage("Impossible d'ouvrir cette image. Veuillez sélectionner un fichier JPG, PNG ou WebP valide.");
     };
     img.src = imageSrc;
   }, [imageSrc]);
 
-  // Handle file selection
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  // Handle file selection from disk or phone
+  const processSelectedFile = (file: File) => {
     setErrorMessage(null);
 
-    if (!file.type.startsWith('image/')) {
+    // Accept standard images and HEIC from phones
+    const isImage = file.type.startsWith('image/') || /\.(jpe?g|png|webp|heic|heif|gif)$/i.test(file.name);
+    if (!isImage) {
       setErrorMessage('Veuillez sélectionner un fichier image valide (JPG, PNG, WebP).');
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
-      setImageSrc(reader.result as string);
+      if (typeof reader.result === 'string') {
+        setImageSrc(reader.result);
+      }
     };
     reader.onerror = () => {
-      setErrorMessage('Erreur lors de la lecture du fichier.');
+      setErrorMessage('Erreur lors de la lecture du fichier photo.');
     };
     reader.readAsDataURL(file);
   };
 
-  // Generate canvas rendering
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    processSelectedFile(file);
+    e.target.value = '';
+  };
+
+  // Drag and drop onto modal drop zone
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOverDropZone(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) {
+      processSelectedFile(file);
+    }
+  };
+
+  // Generate canvas rendering with exact scaling, rotation and framing
   const renderCropCanvas = useCallback(() => {
     if (!loadedImage || !canvasRef.current) return '';
 
@@ -162,117 +195,73 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     if (!ctx) return '';
 
     ctx.clearRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
-    ctx.save();
 
-    // 1. Clip path based on chosen shape
-    const center = OUTPUT_DIM / 2;
-    ctx.beginPath();
-    if (shape === 'circle') {
-      ctx.arc(center, center, OUTPUT_DIM * 0.46, 0, Math.PI * 2);
-    } else if (shape === 'oval') {
-      ctx.ellipse(center, center, OUTPUT_DIM * 0.38, OUTPUT_DIM * 0.46, 0, 0, Math.PI * 2);
-    } else if (shape === 'portrait') {
-      const w = OUTPUT_DIM * 0.74;
-      const h = OUTPUT_DIM * 0.92;
-      const x = (OUTPUT_DIM - w) / 2;
-      const y = (OUTPUT_DIM - h) / 2;
-      ctx.roundRect(x, y, w, h, 24);
-    } else {
-      const s = OUTPUT_DIM * 0.88;
-      const x = (OUTPUT_DIM - s) / 2;
-      ctx.roundRect(x, x, s, s, 20);
-    }
-    ctx.closePath();
-    ctx.clip();
-
-    // 2. Background base fill
-    ctx.fillStyle = '#F5F2EB';
+    // 1. Warm archival paper base (prevents black background in JPEG)
+    ctx.fillStyle = '#FAF8F5';
     ctx.fillRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
 
-    // 3. Transformations: Center -> Pan -> Rotate -> Normalized Scale * User Zoom
-    const baseScale = getBaseScale(loadedImage);
+    // 2. Exact scale calculation: cover scale * user zoom
+    const center = OUTPUT_DIM / 2;
+    const baseScale = getCoverScale(loadedImage, rotation);
     const effectiveScale = baseScale * zoom;
 
+    ctx.save();
     ctx.translate(center + pan.x, center + pan.y);
     ctx.rotate((rotation * Math.PI) / 180);
     ctx.scale(effectiveScale, effectiveScale);
 
-    // Draw the image centered
-    const imgX = -loadedImage.width / 2;
-    const imgY = -loadedImage.height / 2;
-    ctx.drawImage(loadedImage, imgX, imgY);
-
+    // Draw the image centered around the origin
+    ctx.drawImage(loadedImage, -loadedImage.width / 2, -loadedImage.height / 2);
     ctx.restore();
 
-    // 4. Apply Filters
+    // 3. Apply color filters if selected
     if (filter !== 'none') {
-      const imgData = ctx.getImageData(0, 0, OUTPUT_DIM, OUTPUT_DIM);
-      const d = imgData.data;
+      try {
+        const imgData = ctx.getImageData(0, 0, OUTPUT_DIM, OUTPUT_DIM);
+        const d = imgData.data;
 
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i];
-        const g = d[i + 1];
-        const b = d[i + 2];
-        const a = d[i + 3];
-        if (a === 0) continue;
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i];
+          const g = d[i + 1];
+          const b = d[i + 2];
+          const a = d[i + 3];
+          if (a === 0) continue;
 
-        if (filter === 'sepia') {
-          const tr = 0.393 * r + 0.769 * g + 0.189 * b;
-          const tg = 0.349 * r + 0.686 * g + 0.168 * b;
-          const tb = 0.272 * r + 0.534 * g + 0.131 * b;
-          d[i] = Math.min(255, tr * 1.05);
-          d[i + 1] = Math.min(255, tg * 0.98);
-          d[i + 2] = Math.min(255, tb * 0.88);
-        } else if (filter === 'bw') {
-          const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-          const contrast = (gray - 128) * 1.15 + 128;
-          const clamped = Math.max(0, Math.min(255, contrast));
-          d[i] = clamped;
-          d[i + 1] = clamped;
-          d[i + 2] = clamped;
-        } else if (filter === 'warm') {
-          d[i] = Math.min(255, r * 1.08 + 8);
-          d[i + 1] = Math.min(255, g * 1.02 + 4);
-          d[i + 2] = Math.max(0, b * 0.92 - 4);
+          if (filter === 'sepia') {
+            const tr = 0.393 * r + 0.769 * g + 0.189 * b;
+            const tg = 0.349 * r + 0.686 * g + 0.168 * b;
+            const tb = 0.272 * r + 0.534 * g + 0.131 * b;
+            d[i] = Math.min(255, tr * 1.05);
+            d[i + 1] = Math.min(255, tg * 0.98);
+            d[i + 2] = Math.min(255, tb * 0.88);
+          } else if (filter === 'bw') {
+            const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+            const contrast = (gray - 128) * 1.15 + 128;
+            const clamped = Math.max(0, Math.min(255, contrast));
+            d[i] = clamped;
+            d[i + 1] = clamped;
+            d[i + 2] = clamped;
+          } else if (filter === 'warm') {
+            d[i] = Math.min(255, r * 1.08 + 8);
+            d[i + 1] = Math.min(255, g * 1.02 + 4);
+            d[i + 2] = Math.max(0, b * 0.92 - 4);
+          }
         }
+        ctx.putImageData(imgData, 0, 0);
+      } catch (err) {
+        console.warn('Canvas filter error:', err);
       }
-      ctx.putImageData(imgData, 0, 0);
     }
 
-    // 5. Draw decorative archival cameo border
-    ctx.save();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#B89F7C';
-    if (shape === 'circle') {
-      ctx.beginPath();
-      ctx.arc(center, center, OUTPUT_DIM * 0.46, 0, Math.PI * 2);
-      ctx.stroke();
-    } else if (shape === 'oval') {
-      ctx.beginPath();
-      ctx.ellipse(center, center, OUTPUT_DIM * 0.38, OUTPUT_DIM * 0.46, 0, 0, Math.PI * 2);
-      ctx.stroke();
-    } else if (shape === 'portrait') {
-      const w = OUTPUT_DIM * 0.74;
-      const h = OUTPUT_DIM * 0.92;
-      const x = (OUTPUT_DIM - w) / 2;
-      const y = (OUTPUT_DIM - h) / 2;
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, h, 24);
-      ctx.stroke();
-    } else {
-      const s = OUTPUT_DIM * 0.88;
-      const x = (OUTPUT_DIM - s) / 2;
-      ctx.beginPath();
-      ctx.roundRect(x, x, s, s, 20);
-      ctx.stroke();
+    try {
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+      setPreviewDataUrl(dataUrl);
+      setEstimatedSizeKb(Math.round(dataUrl.length / 1024));
+      return dataUrl;
+    } catch {
+      return '';
     }
-    ctx.restore();
-
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.84);
-    setPreviewDataUrl(dataUrl);
-    setEstimatedSizeKb(Math.round(dataUrl.length / 1024));
-    return dataUrl;
-  }, [loadedImage, shape, filter, zoom, pan, rotation, getBaseScale]);
+  }, [loadedImage, filter, zoom, pan, rotation, getCoverScale]);
 
   useEffect(() => {
     if (loadedImage) {
@@ -298,8 +287,8 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     const dx = e.clientX - dragStart.x;
     const dy = e.clientY - dragStart.y;
     setPan({
-      x: dragStart.panX + dx,
-      y: dragStart.panY + dy,
+      x: Math.round(dragStart.panX + dx),
+      y: Math.round(dragStart.panY + dy),
     });
   };
 
@@ -315,7 +304,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   };
 
-  // Touch drag + 2-finger pinch zoom inside cropper
+  // Touch drag + 2-finger pinch zoom
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
     if (!loadedImage) return;
     if (e.touches.length === 1) {
@@ -346,13 +335,13 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
         e.touches[1].clientY - e.touches[0].clientY
       );
       const ratio = dist / Math.max(1, pinchRef.current.dist);
-      const next = Math.min(5, Math.max(0.15, Number((pinchRef.current.startZoom * ratio).toFixed(2))));
+      const next = Math.min(3.5, Math.max(0.2, Number((pinchRef.current.startZoom * ratio).toFixed(2))));
       setZoom(next);
     } else if (e.touches.length === 1 && isDragging && dragStart) {
       const t = e.touches[0];
       setPan({
-        x: dragStart.panX + (t.clientX - dragStart.x),
-        y: dragStart.panY + (t.clientY - dragStart.y),
+        x: Math.round(dragStart.panX + (t.clientX - dragStart.x)),
+        y: Math.round(dragStart.panY + (t.clientY - dragStart.y)),
       });
     }
   };
@@ -366,32 +355,38 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
     if (!loadedImage) return;
-    const factor = e.deltaY > 0 ? 0.92 : 1.08;
-    setZoom((z) => Math.min(5, Math.max(0.15, Number((z * factor).toFixed(2)))));
+    const delta = e.deltaY > 0 ? -0.06 : 0.06;
+    setZoom((z) => Math.min(3.5, Math.max(0.2, Number((z + delta).toFixed(2)))));
   };
 
+  // 90° clockwise rotation
   const handleRotate90 = () => {
     setRotation((r) => (r + 90) % 360);
+    setPan({ x: 0, y: 0 });
   };
 
-  // Fit entire photo inside the medallion (dezoom complete)
+  // Reset positioning & centering
+  const handleRecenter = () => {
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Fit entire photo inside medallion (contain)
   const handleFitWholePhoto = () => {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
-    setRotation(0);
-  };
-
-  // Fill the medallion without margins
-  const handleFillFrame = () => {
     if (!loadedImage) return;
-    const maxDim = Math.max(loadedImage.width, loadedImage.height, 1);
-    const minDim = Math.min(loadedImage.width, loadedImage.height, 1);
-    const fillZoom = Number(((maxDim / minDim) * 1.04).toFixed(2));
-    setZoom(Math.min(5, Math.max(0.15, fillZoom)));
+    const coverScale = getCoverScale(loadedImage, rotation);
+    const containScale = getContainScale(loadedImage, rotation);
+    const fitZoom = Number((containScale / coverScale).toFixed(2));
+    setZoom(Math.max(0.2, fitZoom));
     setPan({ x: 0, y: 0 });
   };
 
-  // Save handler with Firebase Cloud storage
+  // Fill medallion completely (cover)
+  const handleFillFrame = () => {
+    setZoom(1.0);
+    setPan({ x: 0, y: 0 });
+  };
+
+  // Save handler with Cloud Firestore storage
   const handleSaveAndSync = async () => {
     if (!loadedImage) return;
     setIsSaving(true);
@@ -425,22 +420,22 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const datesText = getLifeDates(person);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#1C1917]/70 backdrop-blur-xs p-3 sm:p-6 overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#1C1917]/75 backdrop-blur-[3px] p-3 sm:p-6 overflow-y-auto">
       <div className="fixed inset-0" onClick={onClose} aria-label="Fermer" />
 
-      <div className="relative z-10 w-full max-w-4xl bg-[#FAF8F5] text-[#1C1917] border border-[#E6DFD3] rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[92vh]">
+      <div className="relative z-10 w-full max-w-4xl bg-[#FAF8F5] text-[#1C1917] border border-[#E6DFD3] rounded-2xl shadow-2xl overflow-hidden flex flex-col my-auto max-h-[94vh]">
         {/* Header */}
-        <div className="flex items-center justify-between px-5 sm:px-6 py-4 bg-white border-b border-[#E6DFD3] shrink-0">
-          <div className="flex items-center gap-3">
+        <div className="flex items-center justify-between px-5 sm:px-7 py-4 bg-white border-b border-[#E6DFD3] shrink-0">
+          <div className="flex items-center gap-3.5">
             <div
-              className="h-9 w-9 rounded-full flex items-center justify-center text-white shrink-0"
+              className="h-10 w-10 rounded-full flex items-center justify-center text-white shrink-0 shadow-xs"
               style={{ backgroundColor: accentColor }}
             >
-              <Sparkles className="h-4 w-4" />
+              <Camera className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-[11px] uppercase tracking-[0.2em] text-[#8C7A65] font-medium">
-                Atelier Photo Familial
+              <p className="text-[11px] uppercase tracking-[0.2em] text-[#8C7A65] font-semibold">
+                Photo & Portrait Familial
               </p>
               <h2 className="font-serif text-xl sm:text-2xl font-normal text-[#1C1917]">
                 Portrait de {getFullName(person)}
@@ -451,88 +446,82 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
             type="button"
             onClick={onClose}
             className="p-2 text-[#8E867B] hover:text-[#1C1917] hover:bg-[#F5F2EB] rounded-full transition-colors"
+            title="Fermer"
           >
             <X className="h-5 w-5" />
           </button>
         </div>
 
         {/* Content body */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-7">
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 sm:px-7">
           {errorMessage && (
-            <div className="mb-5 p-3.5 bg-[#FDF2F0] border border-[#E6B8B0] text-xs text-[#8C2D19] flex items-center gap-2 rounded-lg">
+            <div className="mb-5 p-3.5 bg-[#FDF2F0] border border-[#E6B8B0] text-xs text-[#8C2D19] flex items-center gap-2.5 rounded-lg shadow-2xs">
               <AlertCircle className="h-4 w-4 shrink-0" />
               <span>{errorMessage}</span>
             </div>
           )}
 
           {!imageSrc ? (
+            /* Upload / Drop Screen */
             <div
-              className="border-2 border-dashed border-[#D8CFC2] bg-white rounded-xl p-10 text-center flex flex-col items-center justify-center gap-4 hover:border-[#8C7355] transition-colors cursor-pointer"
+              onDragOver={(e) => {
+                e.preventDefault();
+                setIsDragOverDropZone(true);
+              }}
+              onDragLeave={() => setIsDragOverDropZone(false)}
+              onDrop={handleDrop}
               onClick={() => fileInputRef.current?.click()}
+              className={`border-2 border-dashed rounded-2xl p-10 sm:p-14 text-center flex flex-col items-center justify-center gap-4 transition-all cursor-pointer ${
+                isDragOverDropZone
+                  ? 'border-[#8C7355] bg-[#F2EDE4] scale-[0.99]'
+                  : 'border-[#D8CFC2] bg-white hover:border-[#8C7355] hover:bg-[#FAF8F5]'
+              }`}
             >
-              <div className="h-16 w-16 rounded-full bg-[#FAF8F5] border border-[#E2DAD0] flex items-center justify-center text-[#8C7A65]">
-                <Camera className="h-8 w-8" />
+              <div className="h-20 w-20 rounded-full bg-[#FAF8F5] border border-[#E2DAD0] flex items-center justify-center text-[#8C7A65] shadow-xs">
+                <Upload className="h-9 w-9 text-[#8C7355]" />
               </div>
-              <div className="max-w-md">
-                <h3 className="font-serif text-xl font-normal text-[#1C1917]">
-                  Choisir une photo pour {person.first}
+              <div className="max-w-md space-y-1.5">
+                <h3 className="font-serif text-2xl font-normal text-[#1C1917]">
+                  Ajouter une photo de {person.first}
                 </h3>
-                <p className="text-xs text-[#7A7266] mt-1.5">
-                  Sélectionnez une photo depuis votre téléphone ou votre ordinateur (JPG, PNG, WebP).
+                <p className="text-sm text-[#6E665C]">
+                  Cliquez ici pour choisir une photo sur votre téléphone ou votre ordinateur, ou glissez-déposez le fichier.
                 </p>
-                <p className="text-[11px] text-[#9A9184] mt-1">
-                  Elle sera automatiquement adaptée et partagée sur l’arbre familial.
+                <p className="text-xs text-[#8C7A65]">
+                  Formats acceptés : JPG, PNG, WebP (photos de famille, portraits d’époque, scans…)
                 </p>
               </div>
 
               <button
                 type="button"
-                className="mt-2 inline-flex items-center gap-2 px-5 py-2.5 text-xs font-medium text-white rounded-lg transition-opacity hover:opacity-90"
+                className="mt-3 inline-flex items-center gap-2 px-6 py-3 text-sm font-medium text-white rounded-xl shadow-xs transition-opacity hover:opacity-90"
                 style={{ backgroundColor: accentColor }}
               >
-                <Upload className="h-4 w-4" />
+                <Camera className="h-4 w-4" />
                 <span>Sélectionner une photo</span>
               </button>
             </div>
           ) : (
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            /* Interactive Cropping & Preview Workspace */
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
               {/* Left Column: Interactive Canvas & Framing (7 cols) */}
-              <div className="lg:col-span-7 flex flex-col gap-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-[#575047] flex items-center gap-1.5">
-                    <Move className="h-3.5 w-3.5 text-[#8C7A65]" />
-                    Glissez l’image et dézoomez librement (jusqu’à 15 %)
+              <div className="lg:col-span-7 flex flex-col gap-3.5">
+                {/* Visual helper badge */}
+                <div className="flex flex-wrap items-center justify-between gap-2 bg-[#F2EDE4]/70 px-3.5 py-2 rounded-lg border border-[#E2DAD0]">
+                  <span className="text-xs font-medium text-[#4A453E] flex items-center gap-1.5">
+                    <Move className="h-3.5 w-3.5 text-[#8C7355]" />
+                    Glissez la photo pour centrer le visage dans le cercle
                   </span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleFitWholePhoto}
-                      className="px-2.5 py-1 text-xs bg-white border border-[#D8CFC2] hover:border-[#8C7355] text-[#1C1917] rounded-md flex items-center gap-1 transition-colors"
-                      title="Dézoomer pour voir toute la photo en entier"
-                    >
-                      <Minimize2 className="h-3 w-3 text-[#8C7A65]" />
-                      <span>Photo entière</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleFillFrame}
-                      className="px-2.5 py-1 text-xs bg-white border border-[#D8CFC2] hover:border-[#8C7355] text-[#1C1917] rounded-md flex items-center gap-1 transition-colors"
-                      title="Ajuster pour remplir le médaillon"
-                    >
-                      <Maximize2 className="h-3 w-3 text-[#8C7A65]" />
-                      <span>Remplir</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="text-xs text-[#8C7A65] hover:text-[#1C1917] underline transition-colors ml-1"
-                    >
-                      Changer de photo
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="text-xs font-medium text-[#8C7355] hover:text-[#1C1917] underline transition-colors"
+                  >
+                    Changer de photo
+                  </button>
                 </div>
 
-                {/* Canvas Container */}
+                {/* Canvas Container with circular / oval framing overlay */}
                 <div
                   onPointerDown={handlePointerDown}
                   onPointerMove={handlePointerMove}
@@ -543,49 +532,110 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                   onTouchEnd={handleTouchEnd}
                   onTouchCancel={handleTouchEnd}
                   onWheel={handleWheel}
-                  className={`relative w-full aspect-square max-w-[340px] sm:max-w-[380px] mx-auto bg-[#F2EDE4] border border-[#D5C7B4] rounded-xl shadow-inner overflow-hidden select-none touch-none flex items-center justify-center ${
+                  className={`relative w-full aspect-square max-w-[340px] sm:max-w-[380px] mx-auto bg-[#F4F0E8] border-2 border-[#D5C7B4] rounded-2xl shadow-inner overflow-hidden select-none touch-none flex items-center justify-center ${
                     isDragging ? 'cursor-grabbing' : 'cursor-grab'
                   }`}
                   style={{
                     backgroundImage: 'radial-gradient(#D5C7B4 1.5px, transparent 1.5px)',
-                    backgroundSize: '20px 20px',
+                    backgroundSize: '18px 18px',
                   }}
                 >
+                  {/* The actual rendering canvas */}
                   <canvas
                     ref={canvasRef}
-                    className="w-full h-full object-contain pointer-events-none drop-shadow-md"
+                    className="w-full h-full object-contain pointer-events-none drop-shadow-sm"
                   />
 
-                  <div className="absolute inset-0 pointer-events-none border border-[#B89F7C]/20" />
-                  <div className="absolute top-2.5 left-3 bg-white/85 backdrop-blur-xs px-2 py-0.5 rounded text-[11px] font-mono text-[#575047] pointer-events-none">
+                  {/* Framing Mask Overlay (Shades outer areas so user clearly sees the medallion crop) */}
+                  <div className="absolute inset-0 pointer-events-none flex items-center justify-center overflow-hidden">
+                    {shape === 'circle' && (
+                      <div className="w-[90%] h-[90%] rounded-full border-2 border-[#8C7355] shadow-[0_0_0_9999px_rgba(28,25,23,0.48)] transition-all" />
+                    )}
+                    {shape === 'oval' && (
+                      <div className="w-[78%] h-[92%] rounded-[50%] border-2 border-[#8C7355] shadow-[0_0_0_9999px_rgba(28,25,23,0.48)] transition-all" />
+                    )}
+                    {shape === 'portrait' && (
+                      <div className="w-[78%] h-[92%] rounded-2xl border-2 border-[#8C7355] shadow-[0_0_0_9999px_rgba(28,25,23,0.48)] transition-all" />
+                    )}
+                    {shape === 'square' && (
+                      <div className="w-[88%] h-[88%] rounded-xl border-2 border-[#8C7355] shadow-[0_0_0_9999px_rgba(28,25,23,0.48)] transition-all" />
+                    )}
+                  </div>
+
+                  {/* Live zoom badge indicator */}
+                  <div className="absolute top-2.5 left-3 bg-[#1C1917]/75 backdrop-blur-xs text-white px-2.5 py-1 rounded-md text-[11px] font-mono tabular-nums pointer-events-none shadow-xs z-10">
                     Zoom : {Math.round(zoom * 100)}%
                   </div>
                 </div>
 
-                {/* Transform Sliders: Wide Zoom (15% to 500%) & Tilt */}
-                <div className="space-y-3 bg-white p-4 border border-[#E6DFD3] rounded-xl">
-                  <div className="flex items-center gap-2.5">
+                {/* Quick Presets & Zoom Toolset */}
+                <div className="bg-white p-4 border border-[#E6DFD3] rounded-xl space-y-3.5 shadow-2xs">
+                  {/* Quick Action Buttons */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                     <button
                       type="button"
-                      onClick={() => setZoom((z) => Math.max(0.15, Number((z - 0.1).toFixed(2))))}
-                      className="p-1.5 border border-[#E0D7C9] rounded hover:bg-[#FAF8F5] text-[#575047]"
+                      onClick={handleFillFrame}
+                      className="px-3 py-2 text-xs bg-[#FAF8F5] border border-[#D8CFC2] hover:border-[#8C7355] hover:bg-white text-[#1C1917] rounded-lg flex items-center justify-center gap-1.5 transition-all font-medium"
+                      title="Ajuste pour remplir tout le médaillon"
+                    >
+                      <Maximize2 className="h-3.5 w-3.5 text-[#8C7355]" />
+                      <span>Remplir</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleFitWholePhoto}
+                      className="px-3 py-2 text-xs bg-[#FAF8F5] border border-[#D8CFC2] hover:border-[#8C7355] hover:bg-white text-[#1C1917] rounded-lg flex items-center justify-center gap-1.5 transition-all font-medium"
+                      title="Affiche la photo entière sans rien couper"
+                    >
+                      <Minimize2 className="h-3.5 w-3.5 text-[#8C7355]" />
+                      <span>Photo entière</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRotate90}
+                      className="px-3 py-2 text-xs bg-[#FAF8F5] border border-[#D8CFC2] hover:border-[#8C7355] hover:bg-white text-[#1C1917] rounded-lg flex items-center justify-center gap-1.5 transition-all font-medium"
+                      title="Pivote de 90 degrés si la photo est penchée"
+                    >
+                      <RotateCw className="h-3.5 w-3.5 text-[#8C7355]" />
+                      <span>Pivoter 90°</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRecenter}
+                      className="px-3 py-2 text-xs bg-[#FAF8F5] border border-[#D8CFC2] hover:border-[#8C7355] hover:bg-white text-[#1C1917] rounded-lg flex items-center justify-center gap-1.5 transition-all font-medium"
+                      title="Replace la photo au milieu"
+                    >
+                      <Undo2 className="h-3.5 w-3.5 text-[#8C7355]" />
+                      <span>Recentrer</span>
+                    </button>
+                  </div>
+
+                  {/* Smooth Zoom Slider with (-) and (+) buttons */}
+                  <div className="flex items-center gap-3 pt-1 border-t border-[#F2ECE1]">
+                    <span className="text-xs text-[#6E665C] font-medium whitespace-nowrap">
+                      Zoom :
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setZoom((z) => Math.max(0.2, Number((z - 0.1).toFixed(2))))}
+                      className="h-8 w-8 flex items-center justify-center border border-[#D8CFC2] rounded-md bg-[#FAF8F5] hover:bg-white text-[#575047] shrink-0"
                       title="Dézoomer"
                     >
                       <ZoomOut className="h-4 w-4" />
                     </button>
                     <input
                       type="range"
-                      min="0.15"
-                      max="4"
+                      min="0.2"
+                      max="3.0"
                       step="0.02"
                       value={zoom}
                       onChange={(e) => setZoom(parseFloat(e.target.value))}
-                      className="w-full accent-[#8C7355] cursor-pointer"
+                      className="w-full accent-[#8C7355] cursor-pointer h-2"
                     />
                     <button
                       type="button"
-                      onClick={() => setZoom((z) => Math.min(5, Number((z + 0.1).toFixed(2))))}
-                      className="p-1.5 border border-[#E0D7C9] rounded hover:bg-[#FAF8F5] text-[#575047]"
+                      onClick={() => setZoom((z) => Math.min(3.5, Number((z + 0.1).toFixed(2))))}
+                      className="h-8 w-8 flex items-center justify-center border border-[#D8CFC2] rounded-md bg-[#FAF8F5] hover:bg-white text-[#575047] shrink-0"
                       title="Zoomer"
                     >
                       <ZoomIn className="h-4 w-4" />
@@ -594,117 +644,28 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                       {Math.round(zoom * 100)}%
                     </span>
                   </div>
-
-                  {/* Tilt Slider + 90° Rotate */}
-                  <div className="flex items-center gap-3 pt-2 border-t border-[#F0EAE1]">
-                    <span className="text-[11px] text-[#6E665C] whitespace-nowrap">
-                      Rotation :
-                    </span>
-                    <input
-                      type="range"
-                      min="-45"
-                      max="45"
-                      step="1"
-                      value={rotation}
-                      onChange={(e) => setRotation(parseInt(e.target.value, 10))}
-                      className="w-full accent-[#8C7355] cursor-pointer"
-                    />
-                    <span className="text-xs font-mono tabular-nums text-[#6E665C] w-10 text-right">
-                      {rotation}°
-                    </span>
-                    <button
-                      type="button"
-                      onClick={handleRotate90}
-                      className="p-1.5 border border-[#D8CFC2] hover:bg-[#F5F2EB] rounded text-[#1C1917] transition-colors"
-                      title="Pivoter de 90°"
-                    >
-                      <RotateCw className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
                 </div>
               </div>
 
-              {/* Right Column: Filters, Shape & Live In-Situ Preview (5 cols) */}
+              {/* Right Column: Live In-Situ Tree Node Preview & Tone Filters (5 cols) */}
               <div className="lg:col-span-5 flex flex-col gap-4">
-                {/* Framing Shape Selector */}
-                <div>
-                  <label className="block text-xs font-medium text-[#575047] mb-1.5">
-                    Forme du cadre
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {[
-                      { id: 'circle', label: 'Médaillon Rond' },
-                      { id: 'oval', label: 'Camée Ovale' },
-                      { id: 'portrait', label: 'Format Portrait' },
-                      { id: 'square', label: 'Carré Doux' },
-                    ].map((item) => (
-                      <button
-                        key={item.id}
-                        type="button"
-                        onClick={() => setShape(item.id as ShapeType)}
-                        className={`p-2.5 border rounded-lg text-center transition-all ${
-                          shape === item.id
-                            ? 'bg-white border-[#8C7355] shadow-xs font-medium text-[#1C1917]'
-                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
-                        }`}
-                      >
-                        <span className="block text-xs">{item.label}</span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Vintage Photographic Tone Filters */}
-                <div>
-                  <label className="block text-xs font-medium text-[#575047] mb-1.5 flex items-center gap-1.5">
-                    <Sliders className="h-3.5 w-3.5 text-[#8C7A65]" />
-                    Couleur & Filtre
-                  </label>
-                  <div className="grid grid-cols-2 gap-2">
-                    {[
-                      { id: 'none', label: 'Couleur Naturelle', desc: 'Photo originale' },
-                      { id: 'sepia', label: 'Sépia d’Archives', desc: 'Chaleur ancienne' },
-                      { id: 'bw', label: 'Noir & Blanc', desc: 'Argentique doux' },
-                      { id: 'warm', label: 'Lumière Dorée', desc: 'Patine chaude' },
-                    ].map((f) => (
-                      <button
-                        key={f.id}
-                        type="button"
-                        onClick={() => setFilter(f.id as FilterType)}
-                        className={`p-2.5 border rounded-lg text-left transition-all ${
-                          filter === f.id
-                            ? 'bg-white border-[#8C7355] shadow-xs ring-1 ring-[#8C7355]/40'
-                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
-                        }`}
-                      >
-                        <span className="block text-xs font-medium text-[#1C1917]">
-                          {f.label}
-                        </span>
-                        <span className="block text-[10px] text-[#8C7A65]">
-                          {f.desc}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Live In-Situ Tree Node Preview */}
-                <div className="bg-white border border-[#E2DAD0] rounded-xl p-4">
-                  <span className="text-[11px] uppercase tracking-[0.16em] text-[#8C7A65] font-medium block mb-3 flex items-center gap-1.5">
+                {/* Live In-Situ Tree Card Preview */}
+                <div className="bg-white border border-[#E2DAD0] rounded-xl p-4 sm:p-5 shadow-2xs">
+                  <span className="text-[11px] uppercase tracking-[0.18em] text-[#8C7A65] font-semibold block mb-3 flex items-center gap-1.5">
                     <Eye className="h-3.5 w-3.5" />
-                    Aperçu sur sa carte dans l’arbre
+                    Aperçu en direct sur la carte de l’arbre
                   </span>
 
-                  <div className="bg-[#FAF8F5] border border-[#E2DAD0] rounded-lg shadow-xs p-3.5 flex items-center gap-3.5 max-w-[260px] mx-auto">
-                    <div className="h-12 w-12 rounded-full border border-[#DFD6C7] bg-[#F5F1E9] flex items-center justify-center overflow-hidden shrink-0">
+                  <div className="bg-[#FAF8F5] border border-[#E2DAD0] rounded-xl p-4 flex items-center gap-3.5 max-w-[280px] mx-auto shadow-xs">
+                    <div className="h-14 w-14 aspect-square rounded-full border-2 border-[#DFD6C7] bg-[#F5F1E9] flex items-center justify-center overflow-hidden shrink-0 shadow-2xs">
                       {previewDataUrl ? (
                         <img
                           src={previewDataUrl}
-                          alt="Preview"
-                          className="h-full w-full object-cover"
+                          alt="Aperçu"
+                          className="h-full w-full aspect-square rounded-full object-cover"
                         />
                       ) : (
-                        <span className="font-serif text-base text-[#7D6B57]">
+                        <span className="font-serif text-lg text-[#7D6B57]">
                           {(person.first.charAt(0) + person.last.charAt(0)).toUpperCase()}
                         </span>
                       )}
@@ -726,12 +687,74 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                     </div>
                   </div>
 
-                  <div className="mt-3 pt-2.5 border-t border-[#EAE3D6] flex items-center justify-between text-[11px] text-[#7A7266]">
-                    <span className="flex items-center gap-1.5">
-                      <CloudCheck className="h-3.5 w-3.5 text-[#5B8266]" />
-                      Synchronisation Firebase directe
+                  <div className="mt-3.5 pt-2.5 border-t border-[#EAE3D6] flex items-center justify-between text-[11px] text-[#7A7266]">
+                    <span className="flex items-center gap-1.5 text-[#4D7A58] font-medium">
+                      <CloudCheck className="h-3.5 w-3.5" />
+                      Partagé avec toute la famille
                     </span>
                     <span className="font-mono tabular-nums">~{estimatedSizeKb} Ko</span>
+                  </div>
+                </div>
+
+                {/* Tone / Vintage Filters */}
+                <div>
+                  <label className="block text-xs font-semibold text-[#575047] mb-2 flex items-center gap-1.5">
+                    <Sliders className="h-3.5 w-3.5 text-[#8C7A65]" />
+                    Teinte & Style du portrait
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: 'none', label: 'Couleur Naturelle', desc: 'Photo originale' },
+                      { id: 'sepia', label: 'Sépia d’Époque', desc: 'Chaleur vintage' },
+                      { id: 'bw', label: 'Noir & Blanc', desc: 'Argentique doux' },
+                      { id: 'warm', label: 'Lumière Dorée', desc: 'Patine chaleureuse' },
+                    ].map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        onClick={() => setFilter(f.id as FilterType)}
+                        className={`p-2.5 border rounded-xl text-left transition-all ${
+                          filter === f.id
+                            ? 'bg-white border-[#8C7355] shadow-xs ring-1.5 ring-[#8C7355]/40 font-medium'
+                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
+                        }`}
+                      >
+                        <span className="block text-xs font-medium text-[#1C1917]">
+                          {f.label}
+                        </span>
+                        <span className="block text-[10px] text-[#8C7A65]">
+                          {f.desc}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Forme du cadre (optional aesthetic fine-tuning) */}
+                <div>
+                  <label className="block text-xs font-semibold text-[#575047] mb-2">
+                    Forme du cadre de coupe
+                  </label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { id: 'circle', label: 'Médaillon Rond' },
+                      { id: 'oval', label: 'Camée Ovale' },
+                      { id: 'portrait', label: 'Format Portrait' },
+                      { id: 'square', label: 'Carré Doux' },
+                    ].map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setShape(item.id as ShapeType)}
+                        className={`p-2 border rounded-lg text-center text-xs transition-all ${
+                          shape === item.id
+                            ? 'bg-white border-[#8C7355] shadow-2xs font-medium text-[#1C1917]'
+                            : 'bg-[#FAF8F5] border-[#E0D7C9] hover:bg-white text-[#6E665C]'
+                        }`}
+                      >
+                        {item.label}
+                      </button>
+                    ))}
                   </div>
                 </div>
               </div>
@@ -740,10 +763,10 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="px-5 sm:px-6 py-4 bg-white border-t border-[#E6DFD3] flex flex-wrap items-center justify-between gap-3 shrink-0">
+        <div className="px-5 sm:px-7 py-4 bg-white border-t border-[#E6DFD3] flex flex-wrap items-center justify-between gap-3 shrink-0">
           <span className="text-xs text-[#6E665C] flex items-center gap-1.5">
-            <CloudCheck className="h-4 w-4 text-[#4D7A58]" />
-            Partagé automatiquement avec toute la famille
+            <Sparkles className="h-4 w-4 text-[#8C7355]" />
+            Le portrait sera automatiquement visible sur l’arbre généalogique.
           </span>
 
           <div className="flex items-center gap-3">
@@ -751,7 +774,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
               type="button"
               onClick={onClose}
               disabled={isSaving}
-              className="px-4 py-2 text-xs font-medium border border-[#D8CFC2] rounded-lg hover:bg-[#F5F2EB] text-[#1C1917] transition-colors"
+              className="px-4 py-2.5 text-xs font-medium border border-[#D8CFC2] rounded-xl hover:bg-[#F5F2EB] text-[#1C1917] transition-colors"
             >
               Annuler
             </button>
@@ -761,18 +784,18 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                 type="button"
                 onClick={handleSaveAndSync}
                 disabled={isSaving || !loadedImage}
-                className="inline-flex items-center gap-2 px-5 py-2 text-xs font-medium text-white rounded-lg transition-opacity hover:opacity-90 disabled:opacity-50 shadow-xs"
+                className="inline-flex items-center gap-2 px-6 py-2.5 text-xs font-medium text-white rounded-xl transition-all shadow-md hover:shadow-lg disabled:opacity-50"
                 style={{ backgroundColor: accentColor }}
               >
                 {isSaving ? (
                   <>
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                    <span>Enregistrement…</span>
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    <span>Enregistrement en cours…</span>
                   </>
                 ) : (
                   <>
-                    <Check className="h-3.5 w-3.5" />
-                    <span>Enregistrer la photo</span>
+                    <Check className="h-4 w-4" />
+                    <span>Valider et enregistrer le portrait</span>
                   </>
                 )}
               </button>
@@ -780,10 +803,11 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
           </div>
         </div>
 
+        {/* Hidden native file input */}
         <input
           ref={fileInputRef}
           type="file"
-          accept="image/*"
+          accept="image/*,.heic,.heif"
           onChange={handleFileChange}
           className="hidden"
         />

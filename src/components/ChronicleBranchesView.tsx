@@ -199,12 +199,12 @@ export const ChronicleBranchesView: React.FC<ChronicleBranchesViewProps> = ({
                       onClick={() => onSelectPerson(m.id)}
                       className="flex items-center gap-3 p-3 bg-[#FAF8F5] border border-[#E6DFD3] hover:border-[#8C7355] hover:bg-white text-left transition-colors group"
                     >
-                      <div className="h-10 w-10 rounded-full border border-[#DFD6C7] bg-white flex items-center justify-center overflow-hidden shrink-0">
+                      <div className="h-10 w-10 aspect-square rounded-full border border-[#DFD6C7] bg-white flex items-center justify-center overflow-hidden shrink-0">
                         {m.photo ? (
                           <img
                             src={m.photo}
                             alt={getFullName(m)}
-                            className="h-full w-full object-cover"
+                            className="h-full w-full aspect-square rounded-full object-cover scale-[1.09]"
                           />
                         ) : (
                           <span className="font-serif text-xs text-[#7D6B57]">

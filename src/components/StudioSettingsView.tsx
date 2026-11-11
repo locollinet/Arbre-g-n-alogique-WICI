@@ -37,6 +37,7 @@ import {
 import { computeTreeLayout, buildEdgeSvgPath, resolveBranchId } from '../utils/treeLayout';
 import { PersonPhotoRecord } from '../firebase/photoService';
 import { validatePeople } from '../utils/validateFamily';
+import { runFullPhotoRecovery } from '../utils/recoverPhotos';
 import { ExportControls } from './ExportControls';
 
 interface StudioSettingsViewProps {
@@ -188,6 +189,18 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
       onNotify(error instanceof Error ? error.message : 'Fichier de sauvegarde JSON invalide ou corrompu.');
     } finally {
       e.target.value = '';
+    }
+  };
+
+  // Browser Cache Recovery for Photos
+  const handleRecoverPhotos = async () => {
+    onNotify('Recherche approfondie dans le cache du navigateur...');
+    const { recoveredCount, updatedPeople } = await runFullPhotoRecovery(people);
+    if (recoveredCount > 0) {
+      onImportData(updatedPeople);
+      onNotify(`${recoveredCount} photo(s) récupérée(s) du cache et restaurée(s) !`);
+    } else {
+      onNotify('Analyse terminée : aucun portrait supplémentaire en cache.');
     }
   };
 
@@ -605,13 +618,23 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
               <div>
                 <p className="text-xs font-medium text-[#1C1917] flex items-center gap-1.5">
                   <span className="h-2 w-2 rounded-full bg-[#4D7A58]" />
-                  <span>Synchronisation Cloud Firebase active (Accès direct par lien)</span>
+                  <span>Stockage permanent local (IndexedDB) &amp; Synchronisation</span>
                 </p>
                 <p className="text-xs text-[#7A7266] mt-0.5">
-                  Toute personne disposant du lien peut enrichir les fiches et ajouter des portraits pour toute la famille, sans connexion requise.
+                  Vos portraits sont protégés contre la perte de session. Cliquez ci-contre si vous souhaitez scanner le cache pour d'anciennes photos.
                 </p>
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={handleRecoverPhotos}
+              className="px-4 py-2 text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] rounded-lg flex items-center gap-2 shrink-0 transition-colors"
+              title="Scanner le cache du navigateur pour retrouver des photos chargées"
+            >
+              <RotateCcw className="h-3.5 w-3.5 text-[#8C7A65]" />
+              <span>Récupérer les photos du cache</span>
+            </button>
           </div>
 
           {/* Gallery Filter & Search */}
@@ -1090,7 +1113,7 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
             </div>
 
             <div className="pt-2">
-              <ExportControls people={people} settings={settings} />
+              <ExportControls people={people} settings={settings} accentColor={accentColor} />
             </div>
           </div>
 

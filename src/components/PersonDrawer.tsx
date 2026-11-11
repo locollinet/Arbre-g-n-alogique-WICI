@@ -187,6 +187,20 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
     setIsCropperOpen(false);
   };
 
+  const handleRemoveCurrentPhoto = async () => {
+    setPhoto('');
+    if (existingPerson) {
+      if (onRemovePhoto) {
+        try {
+          await onRemovePhoto(existingPerson.id);
+        } catch {
+          // ignore offline remove error
+        }
+      }
+      onSavePerson({ ...existingPerson, photo: undefined });
+    }
+  };
+
   const toggleParent = (id: string) => {
     if (existingPerson) {
       const desc = getDescendantsSet(people, existingPerson.id);
@@ -324,30 +338,34 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
           {mode === 'view' && existingPerson ? (
             <>
               {/* Hero Portrait Card */}
-              <div className="flex items-start gap-4 sm:gap-6 bg-white p-4 sm:p-6 border border-[#E6DFD3]">
-                <div className="relative group/avatar h-18 w-18 sm:h-24 sm:w-24 shrink-0 rounded-full border border-[#D8CFC2] bg-[#F4F0E8] flex items-center justify-center overflow-hidden">
+              <div className="flex items-start gap-4 sm:gap-6 bg-white p-4 sm:p-6 border border-[#E6DFD3] rounded-xl shadow-2xs">
+                <button
+                  type="button"
+                  onClick={() => handleOpenCropper(existingPerson.photo)}
+                  className="relative group/avatar h-20 w-20 sm:h-24 sm:w-24 shrink-0 rounded-full aspect-square border-2 border-[#D8CFC2] hover:border-[#8C7355] bg-[#F4F0E8] flex items-center justify-center overflow-hidden shadow-xs cursor-pointer transition-all"
+                  title={existingPerson.photo ? 'Modifier ou recadrer la photo' : 'Ajouter une photo pour cette personne'}
+                >
                   {existingPerson.photo ? (
                     <img
                       src={existingPerson.photo}
                       alt={getFullName(existingPerson)}
-                      className="h-full w-full object-cover"
+                      className="h-full w-full aspect-square rounded-full object-cover transition-transform duration-200 group-hover/avatar:scale-105"
                     />
                   ) : (
                     <span className="font-serif text-3xl text-[#8C7A65]">
                       {getInitials(existingPerson)}
                     </span>
                   )}
-                  {/* Hover Overlay Button to open cropper */}
-                  <button
-                    type="button"
-                    onClick={() => handleOpenCropper(existingPerson.photo)}
-                    className="absolute inset-0 bg-[#1C1917]/55 text-white flex flex-col items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity text-[10px] font-medium p-1 text-center"
-                    title="Recadrer et sublimer le portrait dans l'Atelier"
-                  >
-                    <Crop className="h-4 w-4 mb-0.5" />
-                    <span>Recadrer</span>
-                  </button>
-                </div>
+                  {/* Camera Icon Overlay */}
+                  <div className="absolute inset-0 bg-[#1C1917]/45 text-white flex flex-col items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity text-[11px] font-medium p-1 text-center">
+                    <Camera className="h-4 w-4 mb-0.5" />
+                    <span>{existingPerson.photo ? 'Modifier' : 'Ajouter'}</span>
+                  </div>
+                  {/* Small badge in corner */}
+                  <div className="absolute bottom-0 right-0 bg-white border border-[#D8CFC2] rounded-full p-1 shadow-xs text-[#8C7355] group-hover/avatar:text-[#1C1917]">
+                    <Camera className="h-3 w-3" />
+                  </div>
+                </button>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 text-xs text-[#8C7A65] font-mono tabular-nums flex-wrap">
                     <span className="flex items-center gap-1.5">
@@ -383,23 +401,55 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                     </p>
                   )}
 
-                  {/* Quick Actions on Person */}
-                  <div className="flex flex-wrap items-center gap-2 mt-4 pt-4 border-t border-[#F0ECE3]">
-                    <button
-                      type="button"
-                      onClick={() => handleOpenCropper(existingPerson.photo)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] transition-colors"
-                    >
-                      <Crop className="h-3.5 w-3.5 text-[#8C7A65]" />
-                      <span>{existingPerson.photo ? 'Recadrer le portrait' : 'Ajouter un portrait'}</span>
-                    </button>
+                  {/* Photo Actions Row */}
+                  <div className="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-[#F0ECE3]">
+                    {existingPerson.photo ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleOpenCropper(existingPerson.photo)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#8C7355] bg-white hover:bg-[#FAF8F5] text-[#1C1917] rounded-lg transition-colors shadow-2xs"
+                        >
+                          <Crop className="h-3.5 w-3.5 text-[#8C7A65]" />
+                          <span>Recadrer la photo</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] rounded-lg transition-colors"
+                        >
+                          <Camera className="h-3.5 w-3.5 text-[#8C7A65]" />
+                          <span>Changer</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRemoveCurrentPhoto}
+                          className="px-2.5 py-1.5 text-xs text-[#8C2D19] hover:bg-[#FDF2F0] rounded-lg transition-colors"
+                        >
+                          Retirer
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleOpenCropper(undefined)}
+                        className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-medium text-white rounded-lg transition-all shadow-xs hover:opacity-90"
+                        style={{ backgroundColor: accentColor }}
+                      >
+                        <Camera className="h-3.5 w-3.5" />
+                        <span>Ajouter une photo</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Family Tree Actions Row */}
+                  <div className="flex flex-wrap items-center gap-2 mt-3 pt-3 border-t border-[#F0ECE3]">
                     <button
                       type="button"
                       onClick={() => onAddChildFor(existingPerson.id)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white transition-colors whitespace-nowrap"
-                      style={{ backgroundColor: accentColor }}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] rounded-lg transition-colors whitespace-nowrap"
                     >
-                      <UserPlus className="h-3.5 w-3.5" />
+                      <UserPlus className="h-3.5 w-3.5 text-[#8C7355]" />
                       Ajouter un enfant
                     </button>
                     {childObjects.length > 0 && (
@@ -409,7 +459,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                           onFocusBranch(existingPerson.id);
                           onClose();
                         }}
-                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D8CFC2] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] transition-colors whitespace-nowrap"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D8CFC2] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] rounded-lg transition-colors whitespace-nowrap"
                       >
                         <GitBranch className="h-3.5 w-3.5 text-[#8C7A65]" />
                         Isoler sa lignée ({childObjects.length})
@@ -594,39 +644,50 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
               )}
 
               {/* Portrait Upload Section */}
-              <div className="flex items-center gap-5 bg-white p-4 border border-[#E6DFD3]">
-                <div className="h-18 w-18 rounded-full border border-[#D8CFC2] bg-[#F4F0E8] flex items-center justify-center overflow-hidden shrink-0">
+              <div className="flex items-center gap-5 bg-white p-4 border border-[#E6DFD3] rounded-xl shadow-2xs">
+                <button
+                  type="button"
+                  onClick={() => (photo ? handleOpenCropper(photo) : fileInputRef.current?.click())}
+                  className="relative group/avatar h-20 w-20 rounded-full aspect-square border-2 border-[#D8CFC2] hover:border-[#8C7355] bg-[#F4F0E8] flex items-center justify-center overflow-hidden shrink-0 shadow-2xs cursor-pointer"
+                  title="Choisir ou recadrer la photo"
+                >
                   {photo ? (
-                    <img src={photo} alt="Portrait" className="h-full w-full object-cover" />
+                    <img src={photo} alt="Portrait" className="h-full w-full aspect-square rounded-full object-cover transition-transform duration-200 group-hover/avatar:scale-105" />
                   ) : (
                     <span className="font-serif text-2xl text-[#8C7A65]">
                       {(first.charAt(0) + last.charAt(0)).toUpperCase() || '?'}
                     </span>
                   )}
-                </div>
-                <div className="space-y-1.5 flex-1 min-w-0">
+                  <div className="absolute inset-0 bg-[#1C1917]/45 text-white flex flex-col items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity text-[10px] font-medium p-1 text-center">
+                    <Camera className="h-4 w-4 mb-0.5" />
+                    <span>{photo ? 'Modifier' : 'Ajouter'}</span>
+                  </div>
+                </button>
+                <div className="space-y-2 flex-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => handleOpenCropper(photo)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#8C7355] bg-white hover:bg-[#FAF8F5] text-[#1C1917] transition-colors shadow-2xs"
-                    >
-                      <Crop className="h-3.5 w-3.5 text-[#8C7A65]" />
-                      <span>{photo ? 'Recadrer & Filtres' : 'Atelier Recadrage Photo'}</span>
-                    </button>
-                    <button
-                      type="button"
                       onClick={() => fileInputRef.current?.click()}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D8CFC2] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] transition-colors"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] rounded-lg transition-colors"
                     >
-                      <Camera className="h-3.5 w-3.5 text-[#8C7A65]" />
-                      <span>Parcourir…</span>
+                      <Camera className="h-3.5 w-3.5 text-[#8C7355]" />
+                      <span>{photo ? 'Changer de photo' : 'Choisir une photo…'}</span>
                     </button>
                     {photo && (
                       <button
                         type="button"
+                        onClick={() => handleOpenCropper(photo)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-[#8C7355] bg-white hover:bg-[#FAF8F5] text-[#1C1917] rounded-lg transition-colors shadow-2xs"
+                      >
+                        <Crop className="h-3.5 w-3.5 text-[#8C7A65]" />
+                        <span>Recadrer & Filtres</span>
+                      </button>
+                    )}
+                    {photo && (
+                      <button
+                        type="button"
                         onClick={() => setPhoto('')}
-                        className="px-2.5 py-1.5 text-xs text-[#8C2D19] hover:bg-[#FDF2F0] transition-colors"
+                        className="px-2.5 py-1.5 text-xs text-[#8C2D19] hover:bg-[#FDF2F0] rounded-lg transition-colors"
                       >
                         Retirer
                       </button>
@@ -634,15 +695,8 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                   </div>
                   <p className="text-[11px] text-[#8E867B] flex items-center gap-1">
                     <CloudCheck className="h-3 w-3 text-[#5B8266]" />
-                    <span>Synchronisé automatiquement en ligne pour toute la famille.</span>
+                    <span>Synchronisé automatiquement pour toute la famille.</span>
                   </p>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handlePhotoUpload}
-                    className="hidden"
-                  />
                 </div>
               </div>
 
@@ -949,6 +1003,15 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
             </div>
           )}
         </div>
+
+        {/* Hidden File Input for Direct Photo Selection */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*,.heic,.heif"
+          onChange={handlePhotoUpload}
+          className="hidden"
+        />
       </aside>
 
       {/* Photo Cropper Modal */}

@@ -12,7 +12,10 @@ import {
   ArrowLeftRight,
   SlidersHorizontal,
   Scan,
-  Layers
+  Layers,
+  Camera,
+  Sparkles,
+  Share2
 } from 'lucide-react';
 import {
   Person,
@@ -39,6 +42,9 @@ interface TreeCanvasViewProps {
   onSelectPerson: (id: string) => void;
   onAddChildFor: (parentId: string) => void;
   onOpenSettingsTab: () => void;
+  onOpenPhotoCropper?: (personId: string) => void;
+  onOpenPoster?: () => void;
+  onOpenShare?: () => void;
   focusBranch: string;
   onChangeFocusBranch: (branchId: string) => void;
   accentColor: string;
@@ -51,6 +57,9 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
   onSelectPerson,
   onAddChildFor,
   onOpenSettingsTab,
+  onOpenPhotoCropper,
+  onOpenPoster,
+  onOpenShare,
   focusBranch,
   onChangeFocusBranch,
   accentColor,
@@ -532,19 +541,26 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
             }}
           />
 
-          {/* Avatar / Monogram */}
+          {/* Avatar / Monogram with quick photo access */}
           {settings.showInitialsAvatar && settings.cardStyle !== 'minimal' && (
             <div
               className={`${
                 settings.cardStyle === 'medallion' ? 'h-10 w-10 mb-1' : 'h-11 w-11'
-              } shrink-0 rounded-full border border-[#DFD6C7] flex items-center justify-center overflow-hidden`}
+              } shrink-0 aspect-square rounded-full border border-[#DFD6C7] flex items-center justify-center overflow-hidden relative group/avatar cursor-pointer hover:border-[#8C7355] transition-all`}
               style={{ backgroundColor: branchPalette.light }}
+              onClick={(e) => {
+                if (onOpenPhotoCropper) {
+                  e.stopPropagation();
+                  onOpenPhotoCropper(person.id);
+                }
+              }}
+              title={person.photo ? 'Modifier ou recadrer la photo' : 'Ajouter une photo'}
             >
               {person.photo ? (
                 <img
                   src={person.photo}
                   alt={getFullName(person)}
-                  className="h-full w-full object-cover"
+                  className="h-full w-full aspect-square rounded-full object-cover transition-transform duration-150 group-hover/avatar:scale-105"
                 />
               ) : (
                 <span
@@ -554,6 +570,10 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
                   {getInitials(person)}
                 </span>
               )}
+              {/* Subtle hover camera overlay indicator */}
+              <div className="absolute inset-0 bg-[#1C1917]/50 text-white flex items-center justify-center opacity-0 group-hover/avatar:opacity-100 transition-opacity">
+                <Camera className="h-3.5 w-3.5" />
+              </div>
             </div>
           )}
 
@@ -762,8 +782,34 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
               )}
             </div>
 
-            <div className="hidden sm:block">
-              <ExportControls people={people} settings={settings} />
+            <div className="flex items-center gap-1.5">
+              {onOpenPoster ? (
+                <button
+                  type="button"
+                  onClick={onOpenPoster}
+                  className="inline-flex min-h-[36px] px-3.5 py-1.5 rounded-full bg-[#8C7355] hover:bg-[#735D43] text-white text-xs font-semibold items-center gap-1.5 transition-colors whitespace-nowrap shadow-2xs"
+                  title="Ouvrir la planche photo A3 d’art avec les portraits"
+                >
+                  <Sparkles className="h-3.5 w-3.5 text-[#F5EBE1]" />
+                  <span>Planche A3</span>
+                </button>
+              ) : null}
+
+              {onOpenShare ? (
+                <button
+                  type="button"
+                  onClick={onOpenShare}
+                  className="inline-flex min-h-[36px] px-3 py-1.5 rounded-full bg-[#1C1917] hover:bg-[#38332E] text-white text-xs font-medium items-center gap-1.5 transition-colors whitespace-nowrap shadow-2xs"
+                  title="Partager l’arbre avec la famille ou sur WhatsApp"
+                >
+                  <Share2 className="h-3.5 w-3.5 text-[#C5B49E]" />
+                  <span className="hidden sm:inline">Partager</span>
+                </button>
+              ) : null}
+
+              {!onOpenPoster && !onOpenShare && (
+                <ExportControls people={people} settings={settings} accentColor={accentColor} />
+              )}
             </div>
           </div>
         </div>
@@ -905,7 +951,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
                   <img
                     src={p.photo}
                     alt={getFullName(p)}
-                    className="h-5 w-5 rounded-full object-cover shrink-0"
+                    className="h-5 w-5 aspect-square rounded-full object-cover shrink-0 scale-[1.09]"
                   />
                 ) : (
                   <span className="h-5 w-5 rounded-full bg-[#E5DEC9] text-[#6E604F] font-serif text-[10px] flex items-center justify-center shrink-0">

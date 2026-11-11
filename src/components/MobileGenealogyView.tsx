@@ -17,7 +17,8 @@ import {
   Camera,
   MapPin,
   Sparkles,
-  Info
+  Info,
+  Share2
 } from 'lucide-react';
 import {
   Person,
@@ -37,6 +38,9 @@ interface MobileGenealogyViewProps {
   onSelectPerson: (id: string) => void;
   onAddChildFor: (parentId: string) => void;
   onSwitchToCanvas: () => void;
+  onOpenPhotoCropper?: (personId: string) => void;
+  onOpenPoster?: () => void;
+  onOpenShare?: () => void;
   accentColor: string;
 }
 
@@ -46,6 +50,9 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
   onSelectPerson,
   onAddChildFor,
   onSwitchToCanvas,
+  onOpenPhotoCropper,
+  onOpenPoster,
+  onOpenShare,
   accentColor,
 }) => {
   // Navigation tabs:
@@ -256,9 +263,37 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
           </button>
         </div>
 
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-xs text-[#6E665C]">À partager avec la famille</span>
-          <ExportControls people={people} settings={settings} />
+        <div className="flex items-center gap-2 pt-1 border-t border-[#EAE3D7]">
+          {onOpenPoster ? (
+            <button
+              type="button"
+              onClick={onOpenPoster}
+              className="flex-1 min-h-[40px] px-3.5 py-2 rounded-xl bg-[#8C7355] text-white text-xs font-semibold flex items-center justify-center gap-1.5 shadow-2xs active:opacity-90 transition-opacity"
+            >
+              <Sparkles className="h-3.5 w-3.5" />
+              <span>Planche Photo A3</span>
+            </button>
+          ) : null}
+
+          {onOpenShare ? (
+            <button
+              type="button"
+              onClick={onOpenShare}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-[#1C1917] text-white text-xs font-medium flex items-center justify-center gap-1.5 shadow-2xs active:opacity-90 transition-opacity"
+            >
+              <Share2 className="h-3.5 w-3.5 text-[#C5B49E]" />
+              <span>Partager</span>
+            </button>
+          ) : null}
+
+          {!onOpenPoster && !onOpenShare && (
+            <ExportControls
+              people={people}
+              settings={settings}
+              accentColor={accentColor}
+              label="Planche A3 / Partager"
+            />
+          )}
         </div>
         {/* Barre de recherche simple */}
         {mobileMode === 'search' && (
@@ -352,9 +387,9 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
                     className="w-full min-h-[52px] flex items-center justify-between p-3 bg-[#FAF8F5] border border-[#E8E2D8] active:border-[#8C7355] text-left rounded-xl transition-all shadow-2xs"
                   >
                     <div className="flex items-center gap-3 min-w-0">
-                      <div className="h-10 w-10 rounded-full bg-white border border-[#D5CBBF] flex items-center justify-center shrink-0">
+                      <div className="h-10 w-10 aspect-square rounded-full bg-white border border-[#D5CBBF] flex items-center justify-center shrink-0 overflow-hidden">
                         {par.photo ? (
-                          <img src={par.photo} alt="" className="h-full w-full rounded-full object-cover" />
+                          <img src={par.photo} alt="" className="h-full w-full aspect-square rounded-full object-cover scale-[1.09]" />
                         ) : (
                           <span className="font-serif text-sm font-medium text-[#7D6B57]">
                             {getInitials(par)}
@@ -386,15 +421,23 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
           {/* SECTION 2 : LA CARTE MAÎTRESSE CENTRALE */}
           <div className="bg-white border-2 border-[#8C7355] rounded-2xl p-5 shadow-sm relative space-y-4">
             <div className="flex items-start gap-4">
-              <div className="h-20 w-20 rounded-full border-2 border-[#D5C7B4] bg-[#FAF8F5] flex items-center justify-center overflow-hidden shrink-0 shadow-xs">
+              <button
+                type="button"
+                onClick={() => (onOpenPhotoCropper ? onOpenPhotoCropper(currentPerson.id) : onSelectPerson(currentPerson.id))}
+                className="relative h-20 w-20 aspect-square rounded-full border-2 border-[#D5C7B4] hover:border-[#8C7355] bg-[#FAF8F5] flex items-center justify-center overflow-hidden shrink-0 shadow-xs cursor-pointer group"
+                title="Ajouter ou modifier la photo"
+              >
                 {currentPerson.photo ? (
-                  <img src={currentPerson.photo} alt="" className="h-full w-full object-cover" />
+                  <img src={currentPerson.photo} alt="" className="h-full w-full aspect-square rounded-full object-cover group-hover:scale-105 transition-transform" />
                 ) : (
                   <span className="font-serif text-3xl font-medium text-[#7D6B57]">
                     {getInitials(currentPerson)}
                   </span>
                 )}
-              </div>
+                <div className="absolute bottom-0 right-0 bg-white border border-[#D5C7B4] rounded-full p-1 text-[#8C7355] shadow-xs">
+                  <Camera className="h-3.5 w-3.5" />
+                </div>
+              </button>
               <div className="flex-1 min-w-0">
                 <span className="text-[11px] uppercase tracking-wider text-[#8C7355] font-medium">
                   {currentPerson.id === 'victoria' ? 'Matriarche de la famille' : 'Fiche active'}
@@ -422,21 +465,33 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
               </div>
             )}
 
-            {/* Gros boutons d'actions clairs avec cibles confortables */}
-            <div className="pt-2 flex flex-col sm:flex-row gap-2.5">
-              <button
-                type="button"
-                onClick={() => onSelectPerson(currentPerson.id)}
-                className="w-full min-h-[48px] px-4 text-sm font-medium text-white rounded-xl flex items-center justify-center gap-2 active:opacity-90 shadow-2xs"
-                style={{ backgroundColor: accentColor }}
-              >
-                <span>Ouvrir son portrait complet</span>
-                <ChevronRight className="h-4 w-4" />
-              </button>
+            {/* Boutons d'actions clairs avec cibles confortables */}
+            <div className="pt-2 flex flex-col gap-2.5">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onSelectPerson(currentPerson.id)}
+                  className="w-full min-h-[46px] px-4 text-xs sm:text-sm font-medium text-white rounded-xl flex items-center justify-center gap-2 active:opacity-90 shadow-2xs"
+                  style={{ backgroundColor: accentColor }}
+                >
+                  <span>Fiche complète</span>
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+                {onOpenPhotoCropper && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenPhotoCropper(currentPerson.id)}
+                    className="w-full min-h-[46px] px-4 text-xs font-medium border border-[#8C7355] bg-white hover:bg-[#FAF8F5] text-[#1C1917] rounded-xl flex items-center justify-center gap-2 shadow-2xs"
+                  >
+                    <Camera className="h-4 w-4 text-[#8C7355]" />
+                    <span>{currentPerson.photo ? 'Recadrer sa photo' : 'Ajouter sa photo'}</span>
+                  </button>
+                )}
+              </div>
               <button
                 type="button"
                 onClick={() => onAddChildFor(currentPerson.id)}
-                className="min-h-[46px] px-4 text-xs font-medium border border-[#D0C6B8] bg-[#FAF8F5] text-[#1C1917] active:bg-[#EAE4D8] rounded-xl flex items-center justify-center gap-1.5"
+                className="w-full min-h-[42px] px-4 text-xs font-medium border border-[#D0C6B8] bg-[#FAF8F5] text-[#1C1917] active:bg-[#EAE4D8] rounded-xl flex items-center justify-center gap-1.5"
               >
                 <Plus className="h-4 w-4 text-[#8C7355]" />
                 <span>Ajouter un enfant à cette personne</span>
@@ -512,9 +567,9 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
                       className="w-full min-h-[56px] flex items-center justify-between p-3.5 bg-[#FAF8F5] border border-[#E8E2D8] active:border-[#8C7355] text-left rounded-xl transition-all shadow-2xs group"
                     >
                       <div className="flex items-center gap-3 min-w-0">
-                        <div className="h-10 w-10 rounded-full bg-white border border-[#D5CBBF] flex items-center justify-center shrink-0">
+                        <div className="h-10 w-10 aspect-square rounded-full bg-white border border-[#D5CBBF] flex items-center justify-center shrink-0 overflow-hidden">
                           {ch.photo ? (
-                            <img src={ch.photo} alt="" className="h-full w-full rounded-full object-cover" />
+                            <img src={ch.photo} alt="" className="h-full w-full aspect-square rounded-full object-cover scale-[1.09]" />
                           ) : (
                             <span className="font-serif text-sm font-medium text-[#7D6B57]">
                               {getInitials(ch)}
@@ -634,12 +689,12 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
                             }}
                             className="flex items-center gap-3.5 min-w-0 flex-1 text-left"
                           >
-                            <div className="h-11 w-11 rounded-full border border-[#DFD6C7] bg-[#FAF8F5] flex items-center justify-center overflow-hidden shrink-0">
+                            <div className="h-11 w-11 aspect-square rounded-full border border-[#DFD6C7] bg-[#FAF8F5] flex items-center justify-center overflow-hidden shrink-0">
                               {person.photo ? (
                                 <img
                                   src={person.photo}
                                   alt=""
-                                  className="h-full w-full object-cover"
+                                  className="h-full w-full aspect-square rounded-full object-cover scale-[1.09]"
                                 />
                               ) : (
                                 <span className="font-serif text-sm font-medium text-[#7D6B57]">

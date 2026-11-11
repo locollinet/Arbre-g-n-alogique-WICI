@@ -18,8 +18,18 @@ import {
   Smartphone,
   Network,
   CloudCheck,
-  UserPlus
+  UserPlus,
+  Sparkles,
+  Share2
 } from 'lucide-react';
+import { FamilyPosterModal } from './components/FamilyPosterModal';
+import { ShareFamilyModal } from './components/ShareFamilyModal';
+import {
+  savePhotoToIndexedDb,
+  getAllPhotosFromIndexedDb,
+  deletePhotoFromIndexedDb,
+} from './utils/localPhotoStorage';
+import { runFullPhotoRecovery } from './utils/recoverPhotos';
 import { testConnection } from './firebase/firebase';
 import {
   subscribeToPersonPhotos,
@@ -38,16 +48,29 @@ export default function App() {
   const [focusBranch, setFocusBranch] = useState<string>('all');
 
   const [people, setPeople] = useState<Person[]>(() => {
+    const seedPhotos = new Map(
+      INITIAL_WICI_PEOPLE.filter((p) => !!p.photo).map((p) => [p.id, p.photo])
+    );
     try {
       const savedV2 = localStorage.getItem(STORAGE_PEOPLE_KEY);
       if (savedV2) {
         const parsed = JSON.parse(savedV2);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.map((p: Person) => ({
+            ...p,
+            photo: p.photo || seedPhotos.get(p.id),
+          }));
+        }
       }
       const legacy = localStorage.getItem('wici-tree-v1');
       if (legacy) {
         const parsedLegacy = JSON.parse(legacy);
-        if (Array.isArray(parsedLegacy) && parsedLegacy.length > 0) return parsedLegacy;
+        if (Array.isArray(parsedLegacy) && parsedLegacy.length > 0) {
+          return parsedLegacy.map((p: Person) => ({
+            ...p,
+            photo: p.photo || seedPhotos.get(p.id),
+          }));
+        }
       }
     } catch {
       // Fallback to initial seed
@@ -77,11 +100,20 @@ export default function App() {
   // Standalone Photo Cropper Atelier state
   const [cropperPersonId, setCropperPersonId] = useState<string | null>(null);
 
+  // Standalone A3 Art Poster & Share Modals
+  const [posterModalOpen, setPosterModalOpen] = useState(false);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+
   // Firebase Cloud Data state (No Auth required — direct link sharing)
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
   const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
   const hasSeededArchiveRef = useRef(false);
+
+  const peopleRef = useRef<Person[]>(people);
+  useEffect(() => {
+    peopleRef.current = people;
+  }, [people]);
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -104,10 +136,43 @@ export default function App() {
     []
   );
 
-  // 1. Initial connection test to Firestore on boot
+  // 1. Initial connection test to Firestore & local IndexedDB photos load on boot
   useEffect(() => {
     testConnection().catch(() => {
       // Offline fallback
+    });
+
+    // Load any photos saved in IndexedDB (immune to 5MB localStorage quota)
+    getAllPhotosFromIndexedDb()
+      .then((localMap) => {
+        if (Object.keys(localMap).length > 0) {
+          setPeople((prev) =>
+            prev.map((p) => {
+              const localPhoto = localMap[p.id]?.photoDataUrl;
+              return localPhoto ? { ...p, photo: localPhoto } : p;
+            })
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn('Chargement IndexedDB:', err);
+      });
+
+    // Deep auto-recovery of any photos from browser cache (localStorage or IndexedDB)
+    runFullPhotoRecovery(people).then(({ recoveredCount, updatedPeople }) => {
+      if (recoveredCount > 0) {
+        setPeople(updatedPeople);
+        notify(`${recoveredCount} photo(s) récupérée(s) du cache du navigateur !`);
+        // Immediately sync recovered photos up to Firestore so all family members get them
+        updatedPeople.forEach((p) => {
+          if (p.photo && !lastCloudPhotos.current[p.id]) {
+            void savePersonPhotoToFirestore({
+              personId: p.id,
+              photoDataUrl: p.photo,
+            }).catch(() => {});
+          }
+        });
+      }
     });
   }, []);
 
@@ -118,7 +183,7 @@ export default function App() {
         setCloudStatus(fromCache ? 'cache' : 'disponible');
         if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
           setPeople((prev) => {
-            // Merge cloud people with currently loaded photos
+            // Merge cloud people with currently loaded photos without losing local portraits
             const prevPhotos = new Map(prev.map((p) => [p.id, p.photo]));
             const cloudPhotos = lastCloudPhotos.current;
             return archiveRecord.people.map((cp) => ({
@@ -135,7 +200,7 @@ export default function App() {
         // Document doesn't exist yet on Firestore: seed the database with our initial copy!
         if (!hasSeededArchiveRef.current) {
           hasSeededArchiveRef.current = true;
-          saveFamilyArchiveToFirestore(people, settings)
+          saveFamilyArchiveToFirestore(peopleRef.current, settings)
             .then(() => setCloudStatus('disponible'))
             .catch(() => {});
         }
@@ -152,11 +217,10 @@ export default function App() {
     setCloudStatus('chargement');
     const unsub = subscribeToPersonPhotos(
       (cloudMap, fromCache) => {
-        const previous = lastCloudPhotos.current;
         lastCloudPhotos.current = cloudMap;
         setCloudStatus(fromCache ? 'cache' : 'disponible');
         setPhotosMap(cloudMap);
-        // Seamlessly merge cloud photos into local people state
+        // Seamlessly merge cloud photos without ever deleting local portraits
         setPeople((prev) => {
           let hasDiff = false;
           const next = prev.map((p) => {
@@ -165,13 +229,39 @@ export default function App() {
               hasDiff = true;
               return { ...p, photo: cloudPhoto };
             }
-            if (!cloudPhoto && previous[p.id] && p.photo === previous[p.id].photoDataUrl) {
-              hasDiff = true;
-              return { ...p, photo: undefined };
-            }
             return p;
           });
           return hasDiff ? next : prev;
+        });
+
+        // Automatically push seed or local photos (e.g. Flore Pilon) to Firestore if missing in the cloud
+        if (!fromCache) {
+          peopleRef.current.forEach((p) => {
+            if (p.photo && !cloudMap[p.id]) {
+              void savePersonPhotoToFirestore({
+                personId: p.id,
+                photoDataUrl: p.photo,
+              }).then((saved) => {
+                if (saved) {
+                  setPhotosMap((prevMap) => ({ ...prevMap, [p.id]: saved }));
+                }
+              }).catch(() => {});
+            }
+          });
+        }
+
+        // Also ensure every photo received from the cloud is cached in IndexedDB
+        Object.values(cloudMap).forEach((rec) => {
+          if (rec.personId && rec.photoDataUrl) {
+            void savePhotoToIndexedDb({
+              personId: rec.personId,
+              photoDataUrl: rec.photoDataUrl,
+              shape: rec.shape,
+              filter: rec.filter,
+              caption: rec.caption,
+              updatedAt: rec.updatedAt,
+            });
+          }
         });
       },
       (err) => {
@@ -181,6 +271,41 @@ export default function App() {
     );
     return () => unsub();
   }, []);
+
+  // Continuous auto-persistence of all photos in people state to IndexedDB and Firestore
+  const syncingPhotoIds = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    people.forEach((p) => {
+      if (p.photo) {
+        // 1. Guaranteed local IndexedDB persistence (immune to 5MB localStorage quota)
+        void savePhotoToIndexedDb({
+          personId: p.id,
+          photoDataUrl: p.photo,
+          updatedAt: new Date().toISOString(),
+        });
+
+        // 2. Guaranteed Cloud Firestore persistence (so all family members see it)
+        if (!photosMap[p.id] && !syncingPhotoIds.current.has(p.id) && cloudStatus !== 'indisponible') {
+          syncingPhotoIds.current.add(p.id);
+          savePersonPhotoToFirestore({
+            personId: p.id,
+            photoDataUrl: p.photo,
+          })
+            .then((saved) => {
+              if (saved) {
+                setPhotosMap((prevMap) => ({ ...prevMap, [p.id]: saved }));
+              }
+            })
+            .catch((err) => {
+              console.warn('Firestore photo auto-save err:', err);
+            })
+            .finally(() => {
+              syncingPhotoIds.current.delete(p.id);
+            });
+        }
+      }
+    });
+  }, [people, photosMap, cloudStatus]);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -316,6 +441,17 @@ export default function App() {
     }
     setFocusBranch('all');
     syncTreeToCloud(importedPeople, nextSettings);
+
+    // Enregistrement immédiat de toutes les photos dans IndexedDB
+    for (const p of importedPeople) {
+      if (p.photo) {
+        void savePhotoToIndexedDb({
+          personId: p.id,
+          photoDataUrl: p.photo,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
   };
 
   const handleRestoreInitialData = () => {
@@ -331,6 +467,7 @@ export default function App() {
   };
 
   const handleSavePersonPhoto = async (personId: string, result: CropResult) => {
+    // 1. Mise à jour immédiate de l'état React
     setPeople((prev) =>
       prev.map((p) => (p.id === personId ? { ...p, photo: result.dataUrl } : p))
     );
@@ -338,6 +475,17 @@ export default function App() {
     const personObj = people.find((p) => p.id === personId);
     const personName = personObj ? getFullName(personObj) : 'Membre';
 
+    // 2. Sauvegarde permanente et garantie dans IndexedDB (espace illimité)
+    await savePhotoToIndexedDb({
+      personId,
+      photoDataUrl: result.dataUrl,
+      shape: result.shape,
+      filter: result.filter,
+      caption: result.caption,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // 3. Sauvegarde dans Firestore si connecté
     try {
       const savedRecord = await savePersonPhotoToFirestore({
         personId,
@@ -347,16 +495,22 @@ export default function App() {
         caption: result.caption,
       });
 
-      setPhotosMap((prev) => ({ ...prev, [personId]: savedRecord }));
-      notify(`Portrait de ${personName} enregistré dans le Cloud Firebase.`);
+      if (savedRecord) {
+        setPhotosMap((prev) => ({ ...prev, [personId]: savedRecord }));
+        notify(`Portrait de ${personName} sauvegardé et synchronisé.`);
+      }
     } catch (err: unknown) {
       console.warn('Sauvegarde Cloud Firestore différée:', err);
-      notify(`Portrait de ${personName} enregistré localement.`);
+      notify(`Portrait de ${personName} sauvegardé en sécurité sur votre appareil.`);
     }
   };
 
   const handleRemovePersonPhoto = async (personId: string) => {
-    await deletePersonPhotoFromFirestore(personId);
+    await deletePhotoFromIndexedDb(personId);
+    await deletePersonPhotoFromFirestore(personId).catch(() => {});
+    setPeople((prev) =>
+      prev.map((p) => (p.id === personId ? { ...p, photo: undefined } : p))
+    );
     setPhotosMap((prev) => {
       const next = { ...prev };
       delete next[personId];
@@ -425,8 +579,32 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: Cloud Sync Pill, Mobile View Toggle & Add Person */}
-        <div className="flex items-center gap-2 shrink-0">
+        {/* Zone 3: Planche A3 d'Art, Partager, Cloud Sync & Add Person */}
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          {/* Bouton Doré Dédié : Planche A3 d'Art */}
+          <button
+            type="button"
+            onClick={() => setPosterModalOpen(true)}
+            className="inline-flex min-h-[36px] px-3 sm:px-3.5 py-1.5 rounded-full text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 hover:opacity-95 items-center justify-center gap-1.5 shadow-xs active:scale-[0.98]"
+            style={{ backgroundColor: '#8C7355' }}
+            title="Ouvrir la planche photo A3 d’art avec les portraits et les noms"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-[#F5EBE1]" />
+            <span>Planche A3</span>
+            <span className="hidden xl:inline text-[10px] uppercase font-mono tracking-wider opacity-90">d’Art</span>
+          </button>
+
+          {/* Bouton Dédié : Partager */}
+          <button
+            type="button"
+            onClick={() => setShareModalOpen(true)}
+            className="inline-flex min-h-[36px] px-2.5 sm:px-3 py-1.5 rounded-full text-xs font-medium border border-[#D5C7B4] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#1C1917] transition-colors whitespace-nowrap shrink-0 items-center justify-center gap-1.5"
+            title="Partager le lien de l’arbre avec la famille ou sur WhatsApp"
+          >
+            <Share2 className="h-3.5 w-3.5 text-[#8C7A65]" />
+            <span className="hidden sm:inline">Partager</span>
+          </button>
+
           <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
             <span
               className={`h-2 w-2 rounded-full ${
@@ -501,6 +679,9 @@ export default function App() {
                   onSelectPerson={handleOpenPerson}
                   onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
                   onSwitchToCanvas={() => setMobileViewMode('canvas')}
+                  onOpenPhotoCropper={(personId) => setCropperPersonId(personId)}
+                  onOpenPoster={() => setPosterModalOpen(true)}
+                  onOpenShare={() => setShareModalOpen(true)}
                   accentColor={accentColor}
                 />
               ) : (
@@ -511,6 +692,9 @@ export default function App() {
                   onSelectPerson={handleOpenPerson}
                   onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
                   onOpenSettingsTab={() => setActiveTab('settings')}
+                  onOpenPhotoCropper={(personId) => setCropperPersonId(personId)}
+                  onOpenPoster={() => setPosterModalOpen(true)}
+                  onOpenShare={() => setShareModalOpen(true)}
                   focusBranch={focusBranch}
                   onChangeFocusBranch={setFocusBranch}
                   accentColor={accentColor}
@@ -526,6 +710,9 @@ export default function App() {
                 onSelectPerson={handleOpenPerson}
                 onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
                 onOpenSettingsTab={() => setActiveTab('settings')}
+                onOpenPhotoCropper={(personId) => setCropperPersonId(personId)}
+                onOpenPoster={() => setPosterModalOpen(true)}
+                onOpenShare={() => setShareModalOpen(true)}
                 focusBranch={focusBranch}
                 onChangeFocusBranch={setFocusBranch}
                 accentColor={accentColor}
@@ -649,6 +836,32 @@ export default function App() {
             await handleSavePersonPhoto(cropperPersonId, result);
             setCropperPersonId(null);
           }}
+        />
+      )}
+
+      {/* Standalone Live A3 Photo Poster Modal */}
+      {posterModalOpen && (
+        <FamilyPosterModal
+          isOpen={posterModalOpen}
+          onClose={() => setPosterModalOpen(false)}
+          people={people}
+          settings={settings}
+          accentColor={accentColor}
+          onOpenShare={() => {
+            setPosterModalOpen(false);
+            setShareModalOpen(true);
+          }}
+        />
+      )}
+
+      {/* Standalone Share Family Modal */}
+      {shareModalOpen && (
+        <ShareFamilyModal
+          isOpen={shareModalOpen}
+          onClose={() => setShareModalOpen(false)}
+          accentColor={accentColor}
+          familyName={settings.familyName}
+          peopleCount={people.length}
         />
       )}
 

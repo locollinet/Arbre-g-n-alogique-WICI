@@ -60,3 +60,29 @@ test('l’arbre vertical empile les fratries terminales pour rester compact et l
   assert.equal(louis.x, jeanne.x);
   assert.ok(jeanne.y > louis.y);
 });
+
+test('les portraits au format data URL s’intègrent parfaitement sur les cartes de l’arbre', () => {
+  const people = structuredClone(INITIAL_WICI_PEOPLE);
+  people.find(p => p.id === 'flore')!.photo = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=';
+  const { svg } = buildPosterSvg(people, DEFAULT_SETTINGS);
+  assert.ok(svg.includes('data:image/jpeg;base64,'));
+  assert.ok(svg.includes('Flore'));
+});
+
+test('la planche photo A3 génère les bonnes dimensions et inclut tous les membres par branche', async () => {
+  const { buildPhotoPosterSvg } = await import('../src/utils/photoPosterGenerator');
+  const landscape = buildPhotoPosterSvg(INITIAL_WICI_PEOPLE, DEFAULT_SETTINGS, { orientation: 'landscape' });
+  assert.equal(landscape.width, 4960);
+  assert.equal(landscape.height, 3508);
+  assert.ok(landscape.svg.includes('BRANCHE FLORE'));
+  assert.ok(landscape.svg.includes('BRANCHE LYDIA'));
+  assert.ok(landscape.svg.includes('Laurence'));
+  assert.ok(landscape.svg.includes('Victoria'));
+
+  const portrait = buildPhotoPosterSvg(INITIAL_WICI_PEOPLE, DEFAULT_SETTINGS, { orientation: 'portrait' });
+  assert.equal(portrait.width, 3508);
+  assert.equal(portrait.height, 4960);
+  assert.ok(portrait.svg.includes('BRANCHE FLORE'));
+});
+
+

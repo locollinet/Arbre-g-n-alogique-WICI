@@ -24,13 +24,13 @@ export function buildPosterSvg(people: Person[], settings: TreeSettings): { svg:
     const maxLines = Math.max(1, Math.floor((n.height - 30) / 17));
     const fontSize = lines.length > maxLines ? 11 : 14;
     const rendered = nameLines([p.first, p.last].filter(Boolean).join(' '), fontSize === 11 ? 25 : 19);
-    const r = Math.min(24, n.height / 2 - 10), cy = n.height / 2;
-    const photo = p.photo?.startsWith('data:image/') ? `<image x="${28-r}" y="${cy-r}" width="${r*2}" height="${r*2}" href="${xml(p.photo)}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatar-${i})"/>` : `<text x="28" y="${cy+5}" text-anchor="middle" fill="#887660" font-family="Georgia,serif" font-size="14">${xml(getInitials(p))}</text>`;
+    const r = Math.min(24, n.height / 2 - 10), cy = n.height / 2, sr = r * 1.09;
+    const photo = p.photo?.startsWith('data:image/') ? `<image x="${28-sr}" y="${cy-sr}" width="${sr*2}" height="${sr*2}" href="${xml(p.photo)}" preserveAspectRatio="xMidYMid slice" clip-path="url(#avatar-${i})"/>` : `<text x="28" y="${cy+5}" text-anchor="middle" fill="#887660" font-family="Georgia,serif" font-size="14">${xml(getInitials(p))}</text>`;
     return `<g transform="translate(${n.x} ${n.y})"><rect width="${n.width}" height="${n.height}" rx="3" fill="#fffdfa" stroke="#ded3c3"/><defs><clipPath id="avatar-${i}"><circle cx="28" cy="${cy}" r="${r}"/></clipPath></defs><circle cx="28" cy="${cy}" r="${r}" fill="#f1ede6"/>${photo}<text x="60" y="${Math.max(16,cy - ((rendered.length-1)*fontSize*1.1)/2 - (dates ? 5 : 0))}" font-family="Georgia,serif" font-size="${fontSize}" fill="#302e2a">${rendered.map((s,j)=>`<tspan x="60" dy="${j ? fontSize*1.15 : 0}">${xml(s)}</tspan>`).join('')}</text>${dates ? `<text x="60" y="${n.height-9}" font-family="Arial,sans-serif" font-size="9" fill="#70685e">${xml(dates)}</text>` : ''}</g>`;
   }).join('');
   const partners = layout.partners.map((q,i) => {
-    const p=q.person, r=13, cy=q.height/2;
-    const photo=p.photo?.startsWith('data:image/') ? `<image x="5" y="${cy-r}" width="26" height="26" href="${xml(p.photo)}" preserveAspectRatio="xMidYMid slice" clip-path="url(#partner-${i})"/>` : `<text x="18" y="${cy+4}" text-anchor="middle" font-family="Georgia,serif" font-size="10" fill="#887660">${xml(getInitials(p))}</text>`;
+    const p=q.person, r=13, cy=q.height/2, sr = r * 1.09;
+    const photo=p.photo?.startsWith('data:image/') ? `<image x="${18-sr}" y="${cy-sr}" width="${sr*2}" height="${sr*2}" href="${xml(p.photo)}" preserveAspectRatio="xMidYMid slice" clip-path="url(#partner-${i})"/>` : `<text x="18" y="${cy+4}" text-anchor="middle" font-family="Georgia,serif" font-size="10" fill="#887660">${xml(getInitials(p))}</text>`;
     return `<g transform="translate(${q.x} ${q.y})"><rect width="${q.width}" height="${q.height}" rx="${q.height/2}" fill="#f3efe8" stroke="#ded3c3"/><defs><clipPath id="partner-${i}"><circle cx="18" cy="${cy}" r="${r}"/></clipPath></defs><circle cx="18" cy="${cy}" r="${r}" fill="#e8e0d5"/>${photo}<text x="36" y="${cy+4}" font-family="Arial,sans-serif" font-size="10" fill="#514a42">avec ${xml([p.first,p.last].filter(Boolean).join(' '))}</text></g>`;
   }).join('');
   const svg = `<?xml version="1.0" encoding="UTF-8"?><svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><rect width="100%" height="100%" fill="#faf8f5"/><text x="${pad}" y="42" font-family="Arial,sans-serif" font-size="12" letter-spacing="3" fill="#8c7355">UNE HISTOIRE DE FAMILLE</text><text x="${pad}" y="84" font-family="Georgia,serif" font-size="38" fill="#302e2a">${xml(settings.familyName)}</text><text x="${width-pad}" y="75" text-anchor="end" font-family="Arial,sans-serif" font-size="12" fill="#85796c">${people.length} PERSONNES · UNE HISTOIRE À TRANSMETTRE</text><path d="M ${pad} 101 H ${width-pad}" stroke="#ded3c3"/><g transform="translate(${pad} ${heading+pad})">${edges}${cards}${partners}</g></svg>`;
@@ -46,6 +46,26 @@ export async function exportPosterPng(people: Person[], settings: TreeSettings) 
   } finally {URL.revokeObjectURL(url);}
 }
 export function printPoster(people: Person[], settings: TreeSettings) {
-  const w=window.open('','_blank'); if(!w) throw new Error('Autorisez les fenêtres supplémentaires pour imprimer ou enregistrer en PDF.');
-  const {svg}=buildPosterSvg(people,settings); w.document.open();w.document.write(`<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Arbre des Wici</title><style>@page{size:landscape;margin:8mm}body{margin:0;font-family:Arial;background:#faf8f5}svg{display:block;width:100%;height:auto}button{margin:1em;padding:.8em;font-size:16px}@media print{button{display:none}}</style></head><body><button onclick="window.print()">Imprimer ou enregistrer en PDF</button>${svg.replace(/^<\?xml[^?]*\?>/,'')}</body></html>`);w.document.close();
+  const { svg } = buildPosterSvg(people, settings);
+  const existing = document.getElementById('poster-print-iframe');
+  if (existing) existing.remove();
+  const iframe = document.createElement('iframe');
+  iframe.id = 'poster-print-iframe';
+  iframe.setAttribute('style', 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;border:none;visibility:hidden;');
+  document.body.appendChild(iframe);
+  const doc = iframe.contentWindow?.document || iframe.contentDocument;
+  if (!doc) throw new Error('Impossible d’ouvrir l’impression.');
+  doc.open();
+  doc.write(`<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Arbre des Wici</title><style>@page{size:landscape;margin:8mm}@media print{body{margin:0;background:#faf8f5}svg{display:block;width:100%;height:auto}}</style></head><body>${svg.replace(/^<\?xml[^?]*\?>/,'')}</body></html>`);
+  doc.close();
+  setTimeout(() => {
+    try {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+    } catch {
+      window.print();
+    } finally {
+      setTimeout(() => iframe.remove(), 60000);
+    }
+  }, 400);
 }

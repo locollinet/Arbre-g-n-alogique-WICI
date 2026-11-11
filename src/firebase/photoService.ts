@@ -54,12 +54,12 @@ export async function savePersonPhotoToFirestore(params: {
 }): Promise<PersonPhotoRecord> {
   const validPersonId = sanitizePersonId(params.personId);
 
-  // Bound check according to firebase-blueprint.json (max 500k characters)
+  // Bound check according to firebase-blueprint.json (max 1000k characters)
   if (!params.photoDataUrl || params.photoDataUrl.length < 10) {
     throw new Error('Image manquante ou invalide.');
   }
-  if (params.photoDataUrl.length > 500000) {
-    throw new Error("L'image compressée dépasse la limite autorisée (500 Ko).");
+  if (params.photoDataUrl.length > 1000000) {
+    throw new Error("L'image compressée dépasse la limite autorisée (1 Mo).");
   }
 
   const record: PersonPhotoRecord = {

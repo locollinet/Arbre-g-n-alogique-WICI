@@ -1,3 +1,5 @@
+import { FLORE_PILON_PHOTO } from './florePhoto';
+
 export interface Person {
   id: string;
   first: string;
@@ -95,6 +97,7 @@ export const INITIAL_WICI_PEOPLE: Person[] = [
     birth: "1939",
     death: "",
     parents: ["victoria", "fiodor"],
+    photo: FLORE_PILON_PHOTO,
     notes: "Seconde branche issue de Victoria Tripel et Fiodor Belawski. Mère de Laurence, Frédéric et Hubert."
   },
   {
