@@ -41,6 +41,7 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
   accentColor,
   onOpenShare,
 }) => {
+  const [posterStyle, setPosterStyle] = useState<'tree' | 'gallery'>('tree');
   const [orientation, setOrientation] = useState<'landscape' | 'portrait'>('landscape');
   const [customTitle, setCustomTitle] = useState('');
   const [customSubtitle, setCustomSubtitle] = useState('');
@@ -52,10 +53,11 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
   const posterOptions = useMemo<PosterOptions>(
     () => ({
       orientation,
+      style: posterStyle,
       title: customTitle.trim() || settings.familyName || 'L’Arbre des Wici',
       subtitle: customSubtitle.trim() || undefined,
     }),
-    [orientation, customTitle, customSubtitle, settings.familyName]
+    [orientation, posterStyle, customTitle, customSubtitle, settings.familyName]
   );
 
   const posterData = useMemo(() => {
@@ -132,10 +134,16 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
                 id="poster-modal-title"
                 className="font-serif text-xl sm:text-2xl font-semibold tracking-tight text-[#1C1917]"
               >
-                Planche Photo A3 & Galerie de Portraits
+                {posterStyle === 'tree'
+                  ? 'Arbre Généalogique Illustré A3'
+                  : 'Planche Photo A3 & Galerie de Portraits'}
               </h2>
               <p className="text-xs text-[#7A7065]">
-                {people.length} membres · Disposition noble avec photos et noms en dessous · Format 420 × 297 mm
+                {people.length} membres ·{' '}
+                {posterStyle === 'tree'
+                  ? 'Vrai dessin d’arbre avec tronc, racines, branches & médaillons'
+                  : 'Disposition en colonnes par branche avec photos'}{' '}
+                · Format A3 ({orientation === 'landscape' ? '420 × 297 mm' : '297 × 420 mm'})
               </p>
             </div>
           </div>
@@ -154,10 +162,50 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
         <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 min-h-0 overflow-hidden">
           {/* Controls Panel (Left on Desktop, Top on Mobile) */}
           <div className="lg:col-span-4 p-5 sm:p-6 bg-white border-r border-[#E6DFD3] overflow-y-auto space-y-6">
-            {/* 1. Format & Orientation */}
+            {/* 1. Style d'oeuvre A3 */}
             <div className="space-y-2">
               <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
-                1. Orientation de la planche A3
+                1. Style de l’affiche A3
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPosterStyle('tree')}
+                  className={`min-h-[48px] px-3 py-2.5 rounded-xl border text-xs font-medium flex flex-col items-center justify-center gap-1 transition-all ${
+                    posterStyle === 'tree'
+                      ? 'border-[#8C7355] bg-[#FAF8F5] text-[#1C1917] shadow-2xs font-semibold'
+                      : 'border-[#E0D7C9] bg-white text-[#6E665C] hover:border-[#8C7355]'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <Sparkles className="h-3.5 w-3.5 text-[#8C7355]" />
+                    <span>Arbre Illustré</span>
+                  </span>
+                  <span className="text-[10px] text-[#8C7A65]">Tronc, branches & feuilles</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setPosterStyle('gallery')}
+                  className={`min-h-[48px] px-3 py-2.5 rounded-xl border text-xs font-medium flex flex-col items-center justify-center gap-1 transition-all ${
+                    posterStyle === 'gallery'
+                      ? 'border-[#8C7355] bg-[#FAF8F5] text-[#1C1917] shadow-2xs font-semibold'
+                      : 'border-[#E0D7C9] bg-white text-[#6E665C] hover:border-[#8C7355]'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <LayoutGrid className="h-3.5 w-3.5 text-[#8C7355]" />
+                    <span>Galerie Branches</span>
+                  </span>
+                  <span className="text-[10px] text-[#8C7A65]">5 colonnes par lignée</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 2. Format & Orientation */}
+            <div className="space-y-2">
+              <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
+                2. Orientation du tirage A3
               </label>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -194,10 +242,10 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
               </div>
             </div>
 
-            {/* 2. Titre & Frontispice */}
+            {/* 3. Titre & Frontispice */}
             <div className="space-y-3">
               <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
-                2. Titre personnalisé
+                3. Titre personnalisé
               </label>
               <div>
                 <input
@@ -210,10 +258,10 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
               </div>
             </div>
 
-            {/* 3. Action Buttons */}
+            {/* 4. Action Buttons */}
             <div className="pt-2 space-y-2.5">
               <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
-                3. Sortie & Impression
+                4. Sortie & Impression
               </label>
 
               <button
@@ -329,14 +377,14 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
             >
               {posterData ? (
                 <div
-                  className="max-h-[72vh] overflow-auto"
+                  className="max-h-[72vh] overflow-auto [&_svg]:w-full [&_svg]:h-auto [&_svg]:max-h-[70vh] [&_svg]:block"
                   dangerouslySetInnerHTML={{
                     __html: posterData.svg.replace(/^<\?xml[^?]*\?>/, ''),
                   }}
                 />
               ) : (
                 <div className="p-12 text-center text-sm text-[#8C7A65]">
-                  Calcul de la planche en cours...
+                  Calcul de l’arbre A3 en cours...
                 </div>
               )}
             </div>

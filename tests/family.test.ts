@@ -78,11 +78,21 @@ test('la planche photo A3 génère les bonnes dimensions et inclut tous les memb
   assert.ok(landscape.svg.includes('BRANCHE LYDIA'));
   assert.ok(landscape.svg.includes('Laurence'));
   assert.ok(landscape.svg.includes('Victoria'));
+  assert.ok(landscape.svg.includes('bt-trunk'));
+  assert.ok(landscape.svg.includes('bt-leaf'));
+  for (const person of INITIAL_WICI_PEOPLE) {
+    assert.ok(landscape.svg.includes(person.first), `Membre manquant sur l'arbre A3: ${person.first}`);
+  }
 
   const portrait = buildPhotoPosterSvg(INITIAL_WICI_PEOPLE, DEFAULT_SETTINGS, { orientation: 'portrait' });
   assert.equal(portrait.width, 3508);
   assert.equal(portrait.height, 4960);
   assert.ok(portrait.svg.includes('BRANCHE FLORE'));
+
+  const gallery = buildPhotoPosterSvg(INITIAL_WICI_PEOPLE, DEFAULT_SETTINGS, { orientation: 'landscape', style: 'gallery' });
+  assert.equal(gallery.width, 4960);
+  assert.equal(gallery.height, 3508);
+  assert.ok(gallery.svg.includes('BRANCHE FLORE'));
 });
 
 

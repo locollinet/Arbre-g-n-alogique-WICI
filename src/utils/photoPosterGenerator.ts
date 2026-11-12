@@ -1,8 +1,10 @@
 import { Person, TreeSettings, getInitials } from '../data/wiciFamily';
 import { resolveBranchId } from './treeLayout';
+import { buildBotanicalTreeSvg } from './botanicalTreePoster';
 
 export interface PosterOptions {
   orientation: 'landscape' | 'portrait';
+  style?: 'tree' | 'gallery';
   title?: string;
   subtitle?: string;
 }
@@ -191,6 +193,9 @@ export function buildPhotoPosterSvg(
   settings: TreeSettings,
   options: PosterOptions
 ): { svg: string; width: number; height: number } {
+  if ((options.style ?? 'tree') === 'tree') {
+    return buildBotanicalTreeSvg(people, settings, options);
+  }
   const isLandscape = options.orientation === 'landscape';
   const width = isLandscape ? 4960 : 3508;
   const height = isLandscape ? 3508 : 4960;
@@ -552,7 +557,10 @@ export function printPhotoPoster(
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <title>${xml(options.title || settings.familyName || 'Planche A3 - Famille Wici')}</title>
+  <title>${xml(options.title || settings.familyName || 'Arbre Généalogique A3 - Famille Wici')}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     @page {
       size: A3 ${isLandscape ? 'landscape' : 'portrait'};
@@ -635,7 +643,8 @@ export async function exportPhotoPosterPng(
       );
     });
 
-    const filename = `planche-a3-famille-${options.orientation}.png`;
+    const prefix = (options.style ?? 'tree') === 'tree' ? 'arbre-a3-famille' : 'planche-a3-famille';
+    const filename = `${prefix}-${options.orientation}.png`;
     downloadBlob(pngBlob, filename);
   } finally {
     URL.revokeObjectURL(url);
@@ -652,7 +661,8 @@ export function exportPhotoPosterSvg(
 ): void {
   const { svg } = buildPhotoPosterSvg(people, settings, options);
   const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-  downloadBlob(blob, `planche-a3-famille-${options.orientation}.svg`);
+  const prefix = (options.style ?? 'tree') === 'tree' ? 'arbre-a3-famille' : 'planche-a3-famille';
+  downloadBlob(blob, `${prefix}-${options.orientation}.svg`);
 }
 
 function downloadBlob(blob: Blob, name: string) {

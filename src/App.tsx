@@ -581,16 +581,16 @@ export default function App() {
 
         {/* Zone 3: Planche A3 d'Art, Partager, Cloud Sync & Add Person */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {/* Bouton Doré Dédié : Planche A3 d'Art */}
+          {/* Bouton Doré Dédié : Arbre A3 d'Art */}
           <button
             type="button"
             onClick={() => setPosterModalOpen(true)}
             className="inline-flex min-h-[36px] px-3 sm:px-3.5 py-1.5 rounded-full text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 hover:opacity-95 items-center justify-center gap-1.5 shadow-xs active:scale-[0.98]"
             style={{ backgroundColor: '#8C7355' }}
-            title="Ouvrir la planche photo A3 d’art avec les portraits et les noms"
+            title="Ouvrir le véritable arbre généalogique illustré A3 d’art avec tronc, branches et portraits"
           >
             <Sparkles className="h-3.5 w-3.5 text-[#F5EBE1]" />
-            <span>Planche A3</span>
+            <span>Arbre A3</span>
             <span className="hidden xl:inline text-[10px] uppercase font-mono tracking-wider opacity-90">d’Art</span>
           </button>
 

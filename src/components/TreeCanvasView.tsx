@@ -788,10 +788,10 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
                   type="button"
                   onClick={onOpenPoster}
                   className="inline-flex min-h-[36px] px-3.5 py-1.5 rounded-full bg-[#8C7355] hover:bg-[#735D43] text-white text-xs font-semibold items-center gap-1.5 transition-colors whitespace-nowrap shadow-2xs"
-                  title="Ouvrir la planche photo A3 d’art avec les portraits"
+                  title="Ouvrir le véritable arbre généalogique illustré A3 d’art"
                 >
                   <Sparkles className="h-3.5 w-3.5 text-[#F5EBE1]" />
-                  <span>Planche A3</span>
+                  <span>Arbre A3</span>
                 </button>
               ) : null}
 
