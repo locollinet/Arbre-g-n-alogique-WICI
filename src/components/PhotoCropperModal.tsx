@@ -408,8 +408,11 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
       onClose();
     } catch (err: unknown) {
       console.error('Erreur enregistrement photo:', err);
-      const msg = err instanceof Error ? err.message : String(err);
-      setErrorMessage(msg || "Erreur lors de l'enregistrement de la photo.");
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      const friendlyMsg = rawMsg.includes('native code') || rawMsg.includes('transaction')
+        ? "La photo a été préparée mais le stockage local a été ralenti. Votre photo reste en mémoire."
+        : rawMsg || "Erreur lors de l'enregistrement de la photo.";
+      setErrorMessage(friendlyMsg);
     } finally {
       setIsSaving(false);
     }

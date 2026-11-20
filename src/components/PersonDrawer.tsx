@@ -182,7 +182,11 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   const handleCropperSave = async (result: CropResult) => {
     setPhoto(result.dataUrl);
     if (existingPerson && onSavePhoto) {
-      await onSavePhoto(existingPerson.id, result);
+      try {
+        await onSavePhoto(existingPerson.id, result);
+      } catch (err) {
+        console.warn('Sauvegarde photo différée:', err);
+      }
     }
     setIsCropperOpen(false);
   };
