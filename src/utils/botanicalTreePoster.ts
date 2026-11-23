@@ -91,23 +91,23 @@ const LINEAGES = [
 const ROOT_STYLE = { ring: '#8C6A3E', light: '#F4ECDD', leaves: ['#6F8A4E', '#8FA060', '#5E7A45', '#A9A862'] };
 const WOOD_BY_DEPTH = ['#4B3826', '#56412D', '#624C37', '#6E5841', '#7A644C', '#857057'];
 
-/** Harmonious twin-season visual themes when the founder has two distinct unions (left vs right). */
+/** Soft unified heritage accents for union ribbons & root medallions (keeping the tree visibly ONE family). */
 const UNION_THEMES = {
   left: {
-    accent: '#2F6652',
-    accentSoft: '#73A690',
-    tint: '#EEF5F0',
-    halo: '#4C8B6E',
-    wood: ['#3E3528', '#4A4031', '#574C3A', '#645845', '#716450', '#7D705B'],
-    leaves: ['#477B5B', '#649673', '#366549', '#82B08B'],
+    accent: '#8C7355',
+    accentSoft: '#C9AE7C',
+    tint: '#FBF7EE',
+    halo: '#8FA060',
+    wood: WOOD_BY_DEPTH,
+    leaves: ['#6F8A4E', '#8FA060', '#5E7A45', '#A9A862'],
   },
   right: {
-    accent: '#9B4A38',
-    accentSoft: '#D18C74',
-    tint: '#FAF0EB',
-    halo: '#BF6C4A',
-    wood: ['#5D3729', '#6B4333', '#784E3D', '#855A48', '#916653', '#9C725E'],
-    leaves: ['#988443', '#B89D56', '#B97846', '#847E42'],
+    accent: '#8C7355',
+    accentSoft: '#C9AE7C',
+    tint: '#FBF7EE',
+    halo: '#8FA060',
+    wood: WOOD_BY_DEPTH,
+    leaves: ['#6F8A4E', '#8FA060', '#5E7A45', '#A9A862'],
   },
 } as const;
 
@@ -379,9 +379,9 @@ function geometryFor(orientation: 'landscape' | 'portrait'): Geometry {
 function gapBetweenSiblings(parent: TNode, left: TNode, right: TNode, hasMultipleUnions: boolean): number {
   if (parent.depth === 0) {
     if (!hasMultipleUnions) return 0.95;
-    if (left.coParentId !== right.coParentId) return 2.55;
-    if (left.children.length === 0 || right.children.length === 0) return 0.55;
-    return 0.78;
+    if (left.coParentId !== right.coParentId) return 1.55;
+    if (left.children.length === 0 || right.children.length === 0) return 0.5;
+    return 0.85;
   }
   return parent.depth === 1 ? 0.28 : 0.16;
 }
@@ -403,7 +403,13 @@ function computeWeights(n: TNode, hasMultipleUnions: boolean): void {
   n.weight = Math.max(minByDepth, childSum);
 }
 
-function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boolean): void {
+function assignAngles(
+  n: TNode,
+  a0: number,
+  a1: number,
+  hasMultipleUnions: boolean,
+  isPortrait = false
+): void {
   if (n.children.length === 0) {
     n.angle = (a0 + a1) / 2;
     return;
@@ -423,7 +429,7 @@ function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boole
     }
     if (groups.length === 2) {
       const midAngle = (a0 + a1) / 2; // 90 deg (center above trunk)
-      const forkHalfGap = 5; // 10 deg open V-fork over the trunk
+      const forkHalfGap = isPortrait ? 4.4 : 4.0; // gentle organic heart-fork keeping both unions visibly united
       const wLeft = groups[0].reduce((s, c) => s + c.weight, 0);
       const wRight = groups[1].reduce((s, c) => s + c.weight, 0);
       const ratio = wLeft / Math.max(1, wLeft + wRight);
@@ -434,9 +440,9 @@ function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boole
         [a0, forkCenter + forkHalfGap],
         [forkCenter - forkHalfGap, a1],
       ];
-      // Upper canopy (Gen III+) can arch gently over a childless inner Gen-II leaf (e.g. Elsa)
-      // to close the top V-gap while strictly respecting the vertical center axis.
-      const upperCenterMargin = 2.6;
+      // Upper canopy (Gen III+) arches warmly over any childless inner Gen-II leaf (e.g. Elsa)
+      // so the crown feels united while strictly respecting the vertical center axis.
+      const upperCenterMargin = isPortrait ? 2.4 : 1.7;
       groups.forEach((grp, gIdx) => {
         const [ga0, ga1] = ranges[gIdx];
         let grpGaps = 0;
@@ -635,7 +641,7 @@ export function buildBotanicalTreeSvg(
 
   // 1. Angular & radial layout of the crown
   computeWeights(root, hasMultipleUnions);
-  assignAngles(root, g.angStart, g.angEnd, hasMultipleUnions);
+  assignAngles(root, g.angStart, g.angEnd, hasMultipleUnions, options.orientation === 'portrait');
   root.children.forEach((c, i) => {
     const mark = (n: TNode) => {
       n.lineage = i;
@@ -746,10 +752,10 @@ export function buildBotanicalTreeSvg(
   }
 
   if (useTwinBoughs) {
-    const forkDX = Math.round(g.rx * 0.135);
-    const forkDY = Math.round(g.ry * 0.135);
-    const plaqueDX = Math.max(225, Math.round(g.rx * 0.12));
-    const plaqueY = crownY - Math.round(forkDY * 0.48);
+    const forkDX = Math.round(g.rx * 0.095);
+    const forkDY = Math.round(g.ry * 0.105);
+    const plaqueDX = Math.max(295, Math.round(g.rx * 0.148));
+    const plaqueY = crownY + 52;
 
     for (const spId of unionGroups) {
       const sObj = founderSpouseById.get(spId);
@@ -796,8 +802,7 @@ export function buildBotanicalTreeSvg(
   for (const n of branchNodes) {
     const parent = n.parent!;
     const style = lineageStyle(n);
-    const uTheme = useTwinBoughs && n.unionSide ? themeForSide(n.unionSide) : null;
-    const leafPalette = uTheme ? uTheme.leaves : style.leaves;
+    const leafPalette = style.leaves;
     let p0: Pt;
     let p1: Pt;
     const p3 = n.pos;
@@ -836,8 +841,7 @@ export function buildBotanicalTreeSvg(
     const len = Math.hypot(p3.x - p0.x, p3.y - p0.y);
     const p2 = { x: p3.x - uChild.x * len * 0.36, y: p3.y - uChild.y * len * 0.36 };
     const w1 = Math.max(9, thickness(n) * 0.5);
-    const woodRamp = uTheme ? uTheme.wood : WOOD_BY_DEPTH;
-    const woodColor = woodRamp[Math.min(n.depth, woodRamp.length - 1)];
+    const woodColor = WOOD_BY_DEPTH[Math.min(n.depth, WOOD_BY_DEPTH.length - 1)];
     wood.push(`<path d="${taperedPath(p0, p1, p2, p3, w0, w1)}" fill="${woodColor}"/>`);
     bark.push(`<path d="${curvePath(p0, p1, p2, p3)}" fill="none" stroke="#E9D9BF" stroke-opacity="0.22" stroke-width="${f(Math.max(2, w1 * 0.22))}" stroke-linecap="round"/>`);
 
@@ -862,8 +866,7 @@ export function buildBotanicalTreeSvg(
   for (const n of all) {
     if (n.depth === 0) continue;
     const style = lineageStyle(n);
-    const uTheme = useTwinBoughs && n.unionSide ? themeForSide(n.unionSide) : null;
-    const leafPalette = uTheme ? uTheme.leaves : style.leaves;
+    const leafPalette = style.leaves;
     const r = medallionRadius(n.depth);
     const outward = n.angle;
     const count = n.children.length === 0 ? 9 : 6;
@@ -923,9 +926,7 @@ export function buildBotanicalTreeSvg(
           p0.y
         )}C${f(cx + side * g.trunkBaseW * 0.24)} ${f(groundY - h * 0.32)} ${f(
           cx + side * g.trunkTopW * 0.32
-        )} ${f(crownY + h * 0.35)} ${f(midTop.x)} ${f(midTop.y)}${boughSegment}" fill="none" stroke="${
-          uTheme ? uTheme.accentSoft : GOLD_LIGHT
-        }" stroke-opacity="0.68" stroke-width="5.5" stroke-linecap="round" stroke-dasharray="11 9"/>`
+        )} ${f(crownY + h * 0.35)} ${f(midTop.x)} ${f(midTop.y)}${boughSegment}" fill="none" stroke="${GOLD_LIGHT}" stroke-opacity="0.46" stroke-width="3.6" stroke-linecap="round" stroke-dasharray="10 9"/>`
       );
     }
   }
@@ -986,15 +987,15 @@ export function buildBotanicalTreeSvg(
     tint: string;
   }[] = [];
 
-  // Pre-reserve collision boxes for the two grand union cartouches right on the charpentières
+  // Pre-reserve collision boxes for the two refined antique-gold union ribbons flanking the upper trunk
   if (useTwinBoughs) {
     for (const bough of unionBoughs.values()) {
       const uTheme = themeForSide(bough.side);
       const uLines: TextLine[] = [
-        { text: 'UNION', size: 20, family: 'sans', fill: uTheme.accent, weight: 700, spacing: 5 },
+        { text: 'UNION', size: 17, family: 'sans', fill: GOLD, weight: 700, spacing: 4.5 },
         {
           text: `${shortFirst(root.person)} & ${shortFirst(bough.spouse.person)}`,
-          size: 38,
+          size: 32,
           family: 'serif',
           fill: INK,
           weight: 700,
@@ -1002,8 +1003,8 @@ export function buildBotanicalTreeSvg(
         },
       ];
       const { w: rawW, h: rawH } = blockSize(uLines);
-      const cw = rawW + 58;
-      const ch = rawH + 28;
+      const cw = rawW + 48;
+      const ch = rawH + 22;
       unionCartouches.push({
         center: bough.plaqueCenter,
         lines: uLines,
@@ -1034,8 +1035,8 @@ export function buildBotanicalTreeSvg(
     return Math.max(0, cr - d);
   };
   const rectRectOverlap = (ax: number, ay: number, aw: number, ah: number, bx: number, by: number, bw: number, bh: number) => {
-    const ox = Math.max(0, (aw + bw) / 2 + 10 - Math.abs(ax - bx));
-    const oy = Math.max(0, (ah + bh) / 2 + 8 - Math.abs(ay - by));
+    const ox = Math.max(0, (aw + bw) / 2 + 16 - Math.abs(ax - bx));
+    const oy = Math.max(0, (ah + bh) / 2 + 12 - Math.abs(ay - by));
     return ox > 0 && oy > 0 ? ox * oy : 0;
   };
 
@@ -1069,7 +1070,11 @@ export function buildBotanicalTreeSvg(
       n.children.length === 0
         ? [n.angle, n.angle - 10, n.angle + 10, n.angle - 20, n.angle + 20, n.angle - 32, n.angle + 32]
         : n.depth === 1
-        ? [-90, -72, -108, -55, -125]
+        ? n.angle < 65
+          ? [-90, -55, -25, 0, -112, 22, -135, 90, 180]
+          : n.angle > 115
+          ? [-90, -125, -155, 180, -68, 158, -45, 90, 0]
+          : [-90, -72, -108, 90, -45, -135, 0, 180]
         : [
             -90,
             n.angle + 180,
@@ -1156,11 +1161,11 @@ export function buildBotanicalTreeSvg(
   }
 
   // Gentle relaxation pass so no label touches any medallion or other label
-  for (let iter = 0; iter < 50; iter++) {
+  for (let iter = 0; iter < 80; iter++) {
     for (const pl of placedLabels) {
       if (pl.locked) continue;
       for (const c of circles) {
-        const ov = rectCircleOverlap(pl.cx, pl.cy, pl.w, pl.h, c.x, c.y, c.r + 4);
+        const ov = rectCircleOverlap(pl.cx, pl.cy, pl.w, pl.h, c.x, c.y, c.r + 6);
         if (ov > 0) {
           const dx = pl.cx - c.x;
           const dy = pl.cy - c.y;
@@ -1171,15 +1176,15 @@ export function buildBotanicalTreeSvg(
       }
       for (const other of placedLabels) {
         if (other === pl) continue;
-        const ox = (pl.w + other.w) / 2 + 8 - Math.abs(pl.cx - other.cx);
-        const oy = (pl.h + other.h) / 2 + 6 - Math.abs(pl.cy - other.cy);
+        const ox = (pl.w + other.w) / 2 + 14 - Math.abs(pl.cx - other.cx);
+        const oy = (pl.h + other.h) / 2 + 12 - Math.abs(pl.cy - other.cy);
         if (ox > 0 && oy > 0) {
           if (ox < oy) {
             const dir = pl.cx >= other.cx ? 1 : -1;
-            pl.cx += dir * ox * (other.locked ? 0.8 : 0.45);
+            pl.cx += dir * ox * (other.locked ? 0.85 : 0.52);
           } else {
             const dir = pl.cy >= other.cy ? 1 : -1;
-            pl.cy += dir * oy * (other.locked ? 0.8 : 0.45);
+            pl.cy += dir * oy * (other.locked ? 0.85 : 0.52);
           }
         }
       }
@@ -1189,7 +1194,7 @@ export function buildBotanicalTreeSvg(
       const alen = Math.hypot(adx, ady) || 1;
       const u = { x: adx / alen, y: ady / alen };
       const minD = pl.anchorR + 14 + Math.abs(u.x) * (pl.w / 2) + Math.abs(u.y) * (pl.h / 2);
-      const maxD = minD + 42;
+      const maxD = minD + 64;
       if (alen < minD) {
         pl.cx = pl.anchor.x + u.x * minD;
         pl.cy = pl.anchor.y + u.y * minD;
@@ -1212,21 +1217,21 @@ export function buildBotanicalTreeSvg(
     labels.push(renderBlock(pl.lines, { x: pl.cx, y: pl.cy }, true));
   }
 
-  // Render the refined color-matched union cartouches right over the left & right charpentières
+  // Render the refined antique-gold union ribbons flanking the upper trunk
   for (const uc of unionCartouches) {
     const x0 = uc.center.x - uc.w / 2;
     const y0 = uc.center.y - uc.h / 2;
     labels.push(
       `<g>` +
-        `<rect x="${f(x0 + 3)}" y="${f(y0 + 5)}" width="${f(uc.w)}" height="${f(uc.h)}" rx="${f(
+        `<rect x="${f(x0 + 2)}" y="${f(y0 + 4)}" width="${f(uc.w)}" height="${f(uc.h)}" rx="${f(
           uc.h / 2
-        )}" fill="#2A1E12" fill-opacity="0.16"/>` +
+        )}" fill="#2A1E12" fill-opacity="0.1"/>` +
         `<rect x="${f(x0)}" y="${f(y0)}" width="${f(uc.w)}" height="${f(uc.h)}" rx="${f(
           uc.h / 2
-        )}" fill="${uc.tint}" fill-opacity="0.97" stroke="${uc.accent}" stroke-width="3.8"/>` +
-        `<rect x="${f(x0 + 7)}" y="${f(y0 + 7)}" width="${f(uc.w - 14)}" height="${f(uc.h - 14)}" rx="${f(
-          (uc.h - 14) / 2
-        )}" fill="none" stroke="${uc.accentSoft}" stroke-width="1.6"/>` +
+        )}" fill="${PAPER}" fill-opacity="0.95" stroke="${GOLD}" stroke-width="2.6"/>` +
+        `<rect x="${f(x0 + 6)}" y="${f(y0 + 6)}" width="${f(uc.w - 12)}" height="${f(uc.h - 12)}" rx="${f(
+          (uc.h - 12) / 2
+        )}" fill="none" stroke="${GOLD_LIGHT}" stroke-width="1.2"/>` +
         renderBlock(uc.lines, uc.center, false) +
         `</g>`
     );
@@ -1267,10 +1272,10 @@ export function buildBotanicalTreeSvg(
   let activeGroupColor = GOLD;
   const closeGroupBar = () => {
     if (useTwinBoughs && activeGroupTopY > 0) {
-      legend += `<rect x="${legendX - 24}" y="${activeGroupTopY}" width="8" height="${Math.max(
+      legend += `<rect x="${legendX - 20}" y="${activeGroupTopY}" width="4" height="${Math.max(
         36,
         legendY - activeGroupTopY + 14
-      )}" rx="4" fill="${activeGroupColor}" fill-opacity="0.82"/>`;
+      )}" rx="2" fill="${GOLD_LIGHT}" fill-opacity="0.8"/>`;
     }
   };
   root.children.forEach((c, i) => {
@@ -1346,61 +1351,16 @@ export function buildBotanicalTreeSvg(
     cornerSprig(88, H - 88, 1, -1) +
     cornerSprig(W - 88, H - 88, -1, -1);
 
-  // Soft watercolor botanical washes behind each half of the canopy + delicate V-cleft parting ray
-  let unionAtmosphere = '';
-  let unionAtmosphereDefs = '';
-  if (useTwinBoughs) {
-    const leftNodes = all.filter((n) => n.unionSide === -1);
-    const rightNodes = all.filter((n) => n.unionSide === 1);
-    const centroid = (list: TNode[], fallbackX: number) => {
-      if (!list.length) return { x: fallbackX, y: crownY - g.ry * 0.5 };
-      const sx = list.reduce((s, n) => s + n.pos.x, 0) / list.length;
-      const sy = list.reduce((s, n) => s + n.pos.y, 0) / list.length;
-      return { x: sx, y: sy };
-    };
-    const lc = centroid(leftNodes, cx - g.rx * 0.45);
-    const rc = centroid(rightNodes, cx + g.rx * 0.45);
-    const washRx = Math.round(g.rx * 0.56);
-    const washRy = Math.round(g.ry * 0.62);
-
-    // Exact empty corridor angle between the rightmost left-union node and leftmost right-union node
-    const minLeftAngle = leftNodes.length ? Math.min(...leftNodes.map((n) => n.angle)) : 95;
-    const maxRightAngle = rightNodes.length ? Math.max(...rightNodes.map((n) => n.angle)) : 85;
-    const dividerAngle = (minLeftAngle + maxRightAngle) / 2;
-    const divStart = placeAt(dividerAngle, 0.14);
-    const divEnd = placeAt(dividerAngle, 1.03);
-
-    unionAtmosphereDefs =
-      `<radialGradient id="bt-wash-left" cx="50%" cy="50%" r="50%">` +
-      `<stop offset="0" stop-color="${UNION_THEMES.left.halo}" stop-opacity="0.14"/>` +
-      `<stop offset="0.58" stop-color="${UNION_THEMES.left.halo}" stop-opacity="0.06"/>` +
-      `<stop offset="1" stop-color="${UNION_THEMES.left.halo}" stop-opacity="0"/>` +
-      `</radialGradient>` +
-      `<radialGradient id="bt-wash-right" cx="50%" cy="50%" r="50%">` +
-      `<stop offset="0" stop-color="${UNION_THEMES.right.halo}" stop-opacity="0.14"/>` +
-      `<stop offset="0.58" stop-color="${UNION_THEMES.right.halo}" stop-opacity="0.06"/>` +
-      `<stop offset="1" stop-color="${UNION_THEMES.right.halo}" stop-opacity="0"/>` +
-      `</radialGradient>` +
-      `<linearGradient id="bt-cleft-ray" x1="${f(divStart.x)}" y1="${f(divStart.y)}" x2="${f(divEnd.x)}" y2="${f(
-        divEnd.y
-      )}" gradientUnits="userSpaceOnUse">` +
-      `<stop offset="0" stop-color="${GOLD}" stop-opacity="0.5"/>` +
-      `<stop offset="0.65" stop-color="${GOLD}" stop-opacity="0.32"/>` +
-      `<stop offset="1" stop-color="${GOLD}" stop-opacity="0.06"/>` +
-      `</linearGradient>`;
-
-    unionAtmosphere =
-      `<g>` +
-      `<ellipse cx="${f(lc.x)}" cy="${f(lc.y)}" rx="${f(washRx)}" ry="${f(washRy)}" fill="url(#bt-wash-left)"/>` +
-      `<ellipse cx="${f(rc.x)}" cy="${f(rc.y)}" rx="${f(washRx)}" ry="${f(washRy)}" fill="url(#bt-wash-right)"/>` +
-      `<line x1="${f(divStart.x)}" y1="${f(divStart.y)}" x2="${f(divEnd.x)}" y2="${f(
-        divEnd.y
-      )}" stroke="url(#bt-cleft-ray)" stroke-width="3" stroke-dasharray="10 14" stroke-linecap="round"/>` +
-      `<polygon points="${f(divStart.x)},${f(divStart.y - 12)} ${f(divStart.x + 8)},${f(divStart.y)} ${f(
-        divStart.x
-      )},${f(divStart.y + 12)} ${f(divStart.x - 8)},${f(divStart.y)}" fill="${GOLD}" fill-opacity="0.65"/>` +
-      `</g>`;
-  }
+  // One soft, warm sunlit botanical watercolor halo embracing the entire family canopy as a single tree
+  const unionAtmosphereDefs =
+    `<radialGradient id="bt-canopy-glow" cx="50%" cy="48%" r="50%">` +
+    `<stop offset="0" stop-color="#8FA060" stop-opacity="0.11"/>` +
+    `<stop offset="0.55" stop-color="#C9AE7C" stop-opacity="0.06"/>` +
+    `<stop offset="1" stop-color="#C9AE7C" stop-opacity="0"/>` +
+    `</radialGradient>`;
+  const unionAtmosphere = `<g><ellipse cx="${f(cx)}" cy="${f(crownY - g.ry * 0.48)}" rx="${f(
+    Math.round(g.rx * 0.96)
+  )}" ry="${f(Math.round(g.ry * 0.72))}" fill="url(#bt-canopy-glow)"/></g>`;
 
   const defs =
     `<defs>` +

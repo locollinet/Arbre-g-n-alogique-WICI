@@ -235,6 +235,24 @@ test('avec Elsa sans descendance, Hubert et Nicolas comblent le haut sans franch
     // Hubert se positionne bien au-dessus d'Elsa (proche horizontalement, nettement au-dessus)
     assert.ok(hubert.y < elsa.y - 400);
     assert.ok(Math.abs(hubert.x - elsa.x) < 120);
+
+    // Aucun chevauchement d'étiquettes (notamment entre Branche Peter et Branche Thérèse)
+    const blocks = [...svg.matchAll(/<rect x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)" rx="18"[^>]*\/>/g)];
+    const boxes = blocks.map((b) => {
+      const x = parseFloat(b[1]);
+      const y = parseFloat(b[2]);
+      return { x, y, x2: x + parseFloat(b[3]), y2: y + parseFloat(b[4]) };
+    });
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i];
+        const b = boxes[j];
+        const overlaps =
+          Math.min(a.x2, b.x2) > Math.max(a.x, b.x) &&
+          Math.min(a.y2, b.y2) > Math.max(a.y, b.y);
+        assert.equal(overlaps, false, `${orientation}: deux étiquettes se chevauchent`);
+      }
+    }
   }
 });
 

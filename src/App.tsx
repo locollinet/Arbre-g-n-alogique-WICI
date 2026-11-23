@@ -228,7 +228,9 @@ export default function App() {
 
     const unsub = subscribeToFamilyArchive(
       (archiveRecord, fromCache) => {
-        setCloudStatus(fromCache ? 'cache' : 'disponible');
+        if (!isFirestoreWriteQuotaExceeded()) {
+          setCloudStatus(fromCache ? 'cache' : 'disponible');
+        }
         if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
           // If the cloud doc only has the untouched default seed while this browser
           // still holds locally added members (added before cloud was connected),
