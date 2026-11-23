@@ -31,12 +31,14 @@ import {
 } from './utils/localPhotoStorage';
 import { runFullPhotoRecovery } from './utils/recoverPhotos';
 import { testConnection } from './firebase/firebase';
+import { isQuotaExceededError } from './firebase/errors';
 import {
   subscribeToPersonPhotos,
   savePersonPhotoToFirestore,
   deletePersonPhotoFromFirestore,
   subscribeToFamilyArchive,
   saveFamilyArchiveToFirestore,
+  isFirestoreWriteQuotaExceeded,
   PersonPhotoRecord
 } from './firebase/photoService';
 
@@ -108,9 +110,10 @@ export default function App() {
   // Firebase Cloud Data state (No Auth required — direct link sharing)
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
-  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
+  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'quota' | 'indisponible'>('chargement');
   const hasSeededArchiveRef = useRef(false);
   const hasReconciledInitialSeedRef = useRef(false);
+  const settingsSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const peopleRef = useRef<Person[]>(people);
   useEffect(() => {
@@ -132,13 +135,22 @@ export default function App() {
   // Helper to persist tree changes to Firestore and report real status
   const syncTreeToCloud = useCallback(
     async (nextPeople: Person[], nextSettings: TreeSettings): Promise<boolean> => {
+      if (isFirestoreWriteQuotaExceeded()) {
+        setCloudStatus('quota');
+        return false;
+      }
       try {
         await saveFamilyArchiveToFirestore(nextPeople, nextSettings);
         setCloudStatus('disponible');
         return true;
       } catch (err) {
-        console.error('Erreur synchronisation Firestore:', err);
-        setCloudStatus('indisponible');
+        if (isQuotaExceededError(err)) {
+          setCloudStatus('quota');
+          console.warn('Quota journalier d’écriture Firestore atteint ; sauvegarde locale conservée.');
+        } else {
+          console.error('Erreur synchronisation Firestore:', err);
+          setCloudStatus('indisponible');
+        }
         return false;
       }
     },
@@ -177,19 +189,13 @@ export default function App() {
         console.warn('Chargement IndexedDB:', err);
       });
 
-    // Deep auto-recovery of any photos from browser cache (localStorage or IndexedDB)
-    // IMPORTANT: merge ONLY missing photos into current state (`prev`) so an async
-    // recovery never overwrites fresher members loaded from Firestore.
+    // Deep local-only auto-recovery of any photos from browser cache (localStorage or IndexedDB).
+    // IMPORTANT: never push cached photos back to Firestore automatically on boot —
+    // doing so burns daily write units on every page load. Photos are synced to Firestore
+    // only when explicitly uploaded or edited by the user.
     runFullPhotoRecovery(peopleRef.current).then(({ recoveredPhotos }) => {
       const recoveredIds = Object.keys(recoveredPhotos);
       if (recoveredIds.length === 0) return;
-
-      const missingInCloud = recoveredIds.filter(
-        (id) =>
-          recoveredPhotos[id] &&
-          !lastCloudPhotos.current[id] &&
-          peopleRef.current.some((p) => p.id === id)
-      );
 
       setPeople((prev) => {
         let changed = false;
@@ -207,17 +213,13 @@ export default function App() {
         }
         return prev;
       });
-
-      if (missingInCloud.length > 0) {
-        notify(`${missingInCloud.length} photo(s) récupérée(s) du cache du navigateur !`);
-        missingInCloud.forEach((personId) => {
-          void savePersonPhotoToFirestore({
-            personId,
-            photoDataUrl: recoveredPhotos[personId],
-          }).catch(() => {});
-        });
-      }
     });
+
+    return () => {
+      if (settingsSyncTimerRef.current) {
+        clearTimeout(settingsSyncTimerRef.current);
+      }
+    };
   }, []);
 
   // 2. Subscribe to real-time Family Archive (people + settings) in Firestore
@@ -241,7 +243,7 @@ export default function App() {
               (p) => !initialIds.has(p.id) && !cloudIds.has(p.id)
             );
 
-            if (cloudIsOnlyDefaultSeed && localExtraMembers.length > 0) {
+            if (cloudIsOnlyDefaultSeed && localExtraMembers.length > 0 && !isFirestoreWriteQuotaExceeded()) {
               const mergedPeople = [...archiveRecord.people, ...localExtraMembers].map((cp) => ({
                 ...cp,
                 photo:
@@ -259,7 +261,11 @@ export default function App() {
                   );
                 })
                 .catch((err) => {
-                  console.error('Erreur fusion initiale Firestore:', err);
+                  if (isQuotaExceededError(err)) {
+                    setCloudStatus('quota');
+                  } else {
+                    console.error('Erreur fusion initiale Firestore:', err);
+                  }
                 });
               return;
             }
@@ -283,32 +289,43 @@ export default function App() {
       },
       () => {
         // Document doesn't exist yet on Firestore: seed the database with our initial copy!
-        if (!hasSeededArchiveRef.current) {
+        if (!hasSeededArchiveRef.current && !isFirestoreWriteQuotaExceeded()) {
           hasSeededArchiveRef.current = true;
           hasReconciledInitialSeedRef.current = true;
           saveFamilyArchiveToFirestore(peopleRef.current, settingsRef.current)
             .then(() => setCloudStatus('disponible'))
             .catch((err) => {
-              console.error('Erreur initialisation archive Firestore:', err);
-              setCloudStatus('indisponible');
+              if (isQuotaExceededError(err)) {
+                setCloudStatus('quota');
+              } else {
+                console.error('Erreur initialisation archive Firestore:', err);
+                setCloudStatus('indisponible');
+              }
             });
         }
       },
       (err) => {
-        console.error('Erreur synchronisation archive Firestore:', err);
-        setCloudStatus('indisponible');
+        if (isQuotaExceededError(err)) {
+          setCloudStatus('quota');
+        } else {
+          console.error('Erreur synchronisation archive Firestore:', err);
+          setCloudStatus('indisponible');
+        }
       }
     );
     return () => unsub();
   }, [notify]);
 
-  // 3. Subscribe to real-time Cloud Photos in Firestore
+  // 3. Subscribe to real-time Cloud Photos in Firestore (strictly read-only listener)
   useEffect(() => {
     setCloudStatus('chargement');
     const unsub = subscribeToPersonPhotos(
       (cloudMap, fromCache) => {
+        const prevCloud = lastCloudPhotos.current;
         lastCloudPhotos.current = cloudMap;
-        setCloudStatus(fromCache ? 'cache' : 'disponible');
+        if (!isFirestoreWriteQuotaExceeded()) {
+          setCloudStatus(fromCache ? 'cache' : 'disponible');
+        }
         setPhotosMap(cloudMap);
         // Seamlessly merge cloud photos without ever deleting local portraits
         setPeople((prev) => {
@@ -324,25 +341,13 @@ export default function App() {
           return hasDiff ? next : prev;
         });
 
-        // Automatically push seed or local photos (e.g. Flore Pilon) to Firestore if missing in the cloud
-        if (!fromCache) {
-          peopleRef.current.forEach((p) => {
-            if (p.photo && !cloudMap[p.id]) {
-              void savePersonPhotoToFirestore({
-                personId: p.id,
-                photoDataUrl: p.photo,
-              }).then((saved) => {
-                if (saved) {
-                  setPhotosMap((prevMap) => ({ ...prevMap, [p.id]: saved }));
-                }
-              }).catch(() => {});
-            }
-          });
-        }
-
-        // Also ensure every photo received from the cloud is cached in IndexedDB
+        // Cache only newly arrived or updated cloud photos in IndexedDB
         Object.values(cloudMap).forEach((rec) => {
-          if (rec.personId && rec.photoDataUrl) {
+          if (
+            rec.personId &&
+            rec.photoDataUrl &&
+            prevCloud[rec.personId]?.photoDataUrl !== rec.photoDataUrl
+          ) {
             void savePhotoToIndexedDb({
               personId: rec.personId,
               photoDataUrl: rec.photoDataUrl,
@@ -355,47 +360,16 @@ export default function App() {
         });
       },
       (err) => {
-        setCloudStatus('indisponible');
-        console.warn('Real-time photo sync note:', err);
+        if (isQuotaExceededError(err)) {
+          setCloudStatus('quota');
+        } else {
+          setCloudStatus('indisponible');
+          console.warn('Real-time photo sync note:', err);
+        }
       }
     );
     return () => unsub();
   }, []);
-
-  // Continuous auto-persistence of all photos in people state to IndexedDB and Firestore
-  const syncingPhotoIds = useRef<Set<string>>(new Set());
-  useEffect(() => {
-    people.forEach((p) => {
-      if (p.photo) {
-        // 1. Guaranteed local IndexedDB persistence (immune to 5MB localStorage quota)
-        void savePhotoToIndexedDb({
-          personId: p.id,
-          photoDataUrl: p.photo,
-          updatedAt: new Date().toISOString(),
-        });
-
-        // 2. Guaranteed Cloud Firestore persistence (so all family members see it)
-        if (!photosMap[p.id] && !syncingPhotoIds.current.has(p.id) && cloudStatus !== 'indisponible') {
-          syncingPhotoIds.current.add(p.id);
-          savePersonPhotoToFirestore({
-            personId: p.id,
-            photoDataUrl: p.photo,
-          })
-            .then((saved) => {
-              if (saved) {
-                setPhotosMap((prevMap) => ({ ...prevMap, [p.id]: saved }));
-              }
-            })
-            .catch((err) => {
-              console.warn('Firestore photo auto-save err:', err);
-            })
-            .finally(() => {
-              syncingPhotoIds.current.delete(p.id);
-            });
-        }
-      }
-    });
-  }, [people, photosMap, cloudStatus]);
 
   useEffect(() => {
     if (!toastMsg) return;
@@ -443,7 +417,14 @@ export default function App() {
     const next = { ...settingsRef.current, ...partial };
     settingsRef.current = next;
     setSettings(next);
-    void syncTreeToCloud(peopleRef.current, next);
+    // Debounce cloud writes so typing in title/subtitle/motto sends 1 write instead of 1 per keystroke
+    if (settingsSyncTimerRef.current) {
+      clearTimeout(settingsSyncTimerRef.current);
+    }
+    settingsSyncTimerRef.current = setTimeout(() => {
+      settingsSyncTimerRef.current = null;
+      void syncTreeToCloud(peopleRef.current, settingsRef.current);
+    }, 1200);
   };
 
   const handleResetSettings = () => {
@@ -532,18 +513,31 @@ export default function App() {
       notify(
         ok
           ? `Fiche de ${getFullName(updated)} enregistrée et synchronisée pour toute la famille.`
+          : isFirestoreWriteQuotaExceeded()
+          ? `Fiche de ${getFullName(updated)} enregistrée localement (quota journalier Firebase atteint — reprise demain).`
           : `Fiche de ${getFullName(updated)} enregistrée localement (synchronisation cloud indisponible).`
       );
     });
 
     if (isNewPerson && updated.photo) {
-      void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo })
-        .then((record) => {
-          setPhotosMap((prev) => ({ ...prev, [updated.id]: record }));
-        })
-        .catch((err) => {
-          console.error('Erreur enregistrement photo Firestore:', err);
-        });
+      void savePhotoToIndexedDb({
+        personId: updated.id,
+        photoDataUrl: updated.photo,
+        updatedAt: new Date().toISOString(),
+      });
+      if (!isFirestoreWriteQuotaExceeded()) {
+        void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo })
+          .then((record) => {
+            setPhotosMap((prev) => ({ ...prev, [updated.id]: record }));
+          })
+          .catch((err) => {
+            if (isQuotaExceededError(err)) {
+              setCloudStatus('quota');
+            } else {
+              console.error('Erreur enregistrement photo Firestore:', err);
+            }
+          });
+      }
     }
   };
 
@@ -636,7 +630,13 @@ export default function App() {
       updatedAt: new Date().toISOString(),
     });
 
-    // 3. Sauvegarde dans Firestore si connecté
+    // 3. Sauvegarde dans Firestore si connecté et quota disponible
+    if (isFirestoreWriteQuotaExceeded()) {
+      setCloudStatus('quota');
+      notify(`Portrait de ${personName} enregistré sur cet appareil (quota Firebase atteint pour aujourd’hui).`);
+      return;
+    }
+
     try {
       const savedRecord = await savePersonPhotoToFirestore({
         personId,
@@ -651,8 +651,13 @@ export default function App() {
         notify(`Portrait de ${personName} sauvegardé et synchronisé.`);
       }
     } catch (err: unknown) {
-      console.warn('Sauvegarde Cloud Firestore différée:', err);
-      notify(`Portrait de ${personName} sauvegardé en sécurité sur votre appareil.`);
+      if (isQuotaExceededError(err)) {
+        setCloudStatus('quota');
+        notify(`Portrait de ${personName} sauvegardé sur cet appareil (quota journalier Firebase atteint — reprise demain).`);
+      } else {
+        console.warn('Sauvegarde Cloud Firestore différée:', err);
+        notify(`Portrait de ${personName} sauvegardé en sécurité sur votre appareil.`);
+      }
     }
   };
 
@@ -759,15 +764,25 @@ export default function App() {
           <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
             <span
               className={`h-2 w-2 rounded-full ${
-                cloudStatus === 'indisponible' ? 'bg-[#C87D55]' : 'bg-[#4D7A58]'
+                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'bg-[#C87D55]' : 'bg-[#4D7A58]'
               }`}
             />
-            <CloudCheck className="h-3.5 w-3.5 text-[#4D7A58]" />
-            <span className="text-[#4D7A58] font-medium">
+            <CloudCheck
+              className={`h-3.5 w-3.5 ${
+                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'text-[#A05A37]' : 'text-[#4D7A58]'
+              }`}
+            />
+            <span
+              className={`font-medium ${
+                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'text-[#A05A37]' : 'text-[#4D7A58]'
+              }`}
+            >
               {cloudStatus === 'disponible'
                 ? 'Synchronisé Firebase'
                 : cloudStatus === 'cache'
                 ? 'Synchronisé (cache)'
+                : cloudStatus === 'quota'
+                ? 'Quota atteint · local'
                 : cloudStatus === 'indisponible'
                 ? 'Sauvegarde locale'
                 : 'Connexion…'}

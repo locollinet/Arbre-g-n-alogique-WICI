@@ -8,7 +8,7 @@ import {
   onSnapshot
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
-import { OperationType, handleFirestoreError } from './errors';
+import { OperationType, handleFirestoreError, isQuotaExceededError } from './errors';
 import { Person, TreeSettings } from '../data/wiciFamily';
 
 export interface PersonPhotoRecord {
@@ -30,6 +30,20 @@ export interface FamilyArchiveRecord {
 const COLLECTION_NAME = 'personPhotos';
 const ARCHIVE_COLLECTION = 'familyArchive';
 const ARCHIVE_DOC_ID = 'main';
+
+// Circuit breaker: once Firestore reports daily write quota exhaustion, stop queuing
+// new writes in this session so the SDK never enters an infinite backoff retry loop.
+let firestoreWriteQuotaExceeded = false;
+
+export function isFirestoreWriteQuotaExceeded(): boolean {
+  return firestoreWriteQuotaExceeded;
+}
+
+function assertWriteQuotaAvailable(path: string): void {
+  if (firestoreWriteQuotaExceeded) {
+    throw new Error(`FIRESTORE_WRITE_QUOTA_EXCEEDED (${path})`);
+  }
+}
 
 /**
  * Validates personId matches security requirements (alphanumeric, dash, underscore, max 128)
@@ -77,10 +91,14 @@ export async function savePersonPhotoToFirestore(params: {
   }
 
   const docRef = doc(db, COLLECTION_NAME, validPersonId);
+  assertWriteQuotaAvailable(`${COLLECTION_NAME}/${validPersonId}`);
   try {
     await setDoc(docRef, record);
     return record;
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      firestoreWriteQuotaExceeded = true;
+    }
     handleFirestoreError(error, OperationType.WRITE, `${COLLECTION_NAME}/${validPersonId}`);
   }
 }
@@ -91,9 +109,13 @@ export async function savePersonPhotoToFirestore(params: {
 export async function deletePersonPhotoFromFirestore(personId: string): Promise<void> {
   const validPersonId = sanitizePersonId(personId);
   const docRef = doc(db, COLLECTION_NAME, validPersonId);
+  assertWriteQuotaAvailable(`${COLLECTION_NAME}/${validPersonId}`);
   try {
     await deleteDoc(docRef);
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      firestoreWriteQuotaExceeded = true;
+    }
     handleFirestoreError(error, OperationType.DELETE, `${COLLECTION_NAME}/${validPersonId}`);
   }
 }
@@ -141,7 +163,6 @@ export function subscribeToPersonPhotos(
   const colRef = collection(db, COLLECTION_NAME);
   return onSnapshot(
     colRef,
-    { includeMetadataChanges: true },
     (snapshot) => {
       const map: Record<string, PersonPhotoRecord> = {};
       snapshot.forEach((docSnap) => {
@@ -199,10 +220,14 @@ export async function saveFamilyArchiveToFirestore(
   if (settings) {
     record.settings = JSON.parse(JSON.stringify(settings));
   }
+  assertWriteQuotaAvailable(`${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
   try {
     await setDoc(docRef, record);
     return record;
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      firestoreWriteQuotaExceeded = true;
+    }
     handleFirestoreError(error, OperationType.WRITE, `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
   }
 }

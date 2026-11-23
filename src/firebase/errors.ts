@@ -26,6 +26,20 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export function isQuotaExceededError(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'resource-exhausted') {
+    return true;
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    msg.includes('resource-exhausted') ||
+    msg.includes('Quota exceeded') ||
+    msg.includes('Quota limit exceeded') ||
+    msg.includes('FIRESTORE_WRITE_QUOTA_EXCEEDED')
+  );
+}
+
 export function handleFirestoreError(
   error: unknown,
   operationType: OperationType,
