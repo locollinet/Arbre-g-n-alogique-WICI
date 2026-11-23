@@ -142,7 +142,7 @@ export async function deepScanIndexedDbForPhotos(): Promise<Record<string, strin
  */
 export async function runFullPhotoRecovery(
   currentPeople: Person[]
-): Promise<{ recoveredCount: number; updatedPeople: Person[] }> {
+): Promise<{ recoveredCount: number; updatedPeople: Person[]; recoveredPhotos: Record<string, string> }> {
   const localPhotos = scanLocalStorageForPhotos();
   const idbPhotos = await deepScanIndexedDbForPhotos();
 
@@ -150,7 +150,7 @@ export async function runFullPhotoRecovery(
   const foundKeys = Object.keys(allFound);
 
   if (foundKeys.length === 0) {
-    return { recoveredCount: 0, updatedPeople: currentPeople };
+    return { recoveredCount: 0, updatedPeople: currentPeople, recoveredPhotos: {} };
   }
 
   // Persist into our robust IndexedDB
@@ -173,5 +173,5 @@ export async function runFullPhotoRecovery(
     return p;
   });
 
-  return { recoveredCount: count, updatedPeople: updated };
+  return { recoveredCount: count, updatedPeople: updated, recoveredPhotos: allFound };
 }

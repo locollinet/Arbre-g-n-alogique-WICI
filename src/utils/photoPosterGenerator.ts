@@ -1,5 +1,5 @@
 import { Person, TreeSettings, getInitials } from '../data/wiciFamily';
-import { resolveBranchId } from './treeLayout';
+import { resolveBranchId, getCoreLineageIds } from './treeLayout';
 import { buildBotanicalTreeSvg } from './botanicalTreePoster';
 
 export interface PosterOptions {
@@ -7,6 +7,7 @@ export interface PosterOptions {
   style?: 'tree' | 'gallery';
   title?: string;
   subtitle?: string;
+  showSpouses?: boolean;
 }
 
 const xml = (value: string | undefined | null) =>
@@ -200,11 +201,10 @@ export function buildPhotoPosterSvg(
   const width = isLandscape ? 4960 : 3508;
   const height = isLandscape ? 3508 : 4960;
 
+  const includeSpouses = options.showSpouses ?? settings.showSpouses;
   const byId = new Map(people.map((p) => [p.id, p]));
+  const coreLineageIds = getCoreLineageIds(people);
   const title = options.title || settings.familyName || 'L’Arbre des Wici';
-  const subtitle =
-    options.subtitle ||
-    `${people.length} PERSONNES RÉUNIES · 5 BRANCHES FAMILIALES · UNE HISTOIRE À TRANSMETTRE`;
 
   // 1. Group members by branch
   const branchMembers: Record<string, Person[]> = {
@@ -218,11 +218,14 @@ export function buildPhotoPosterSvg(
   const founders: Person[] = [];
 
   for (const p of people) {
+    if (!includeSpouses && !coreLineageIds.has(p.id)) {
+      continue;
+    }
     if (['victoria', 'fiodor', 'aloisi'].includes(p.id)) {
       founders.push(p);
       continue;
     }
-    const bId = resolveBranchId(p.id, byId);
+    const bId = resolveBranchId(p.id, byId, people);
     if (branchMembers[bId]) {
       branchMembers[bId].push(p);
     } else {
@@ -232,9 +235,16 @@ export function buildPhotoPosterSvg(
   }
 
   // Sort founders: Victoria in center, Fiodor left, Aloïsi right
-  const sortedFounders = ['fiodor', 'victoria', 'aloisi']
+  const sortedFounders = (includeSpouses ? ['fiodor', 'victoria', 'aloisi'] : ['victoria'])
     .map((id) => byId.get(id))
     .filter(Boolean) as Person[];
+
+  const visibleCount =
+    sortedFounders.length +
+    Object.values(branchMembers).reduce((acc, list) => acc + list.length, 0);
+  const subtitle =
+    options.subtitle ||
+    `${visibleCount} PERSONNES RÉUNIES · 5 BRANCHES FAMILIALES · UNE HISTOIRE À TRANSMETTRE`;
 
   // 2. Sort members inside each branch: head of branch first, then by birth year
   for (const bKey of Object.keys(branchMembers)) {
@@ -369,7 +379,12 @@ export function buildPhotoPosterSvg(
           cfg.color,
           cfg.light,
           {
-            role: m.id === cfg.founderId ? 'Chef de Branche' : undefined,
+            role:
+              m.id === cfg.founderId
+                ? 'Chef de Branche'
+                : !coreLineageIds.has(m.id)
+                ? 'Belle-famille'
+                : undefined,
           }
         );
       });
@@ -441,7 +456,12 @@ export function buildPhotoPosterSvg(
           cfg.color,
           cfg.light,
           {
-            role: m.id === cfg.founderId ? 'Chef de Branche' : undefined,
+            role:
+              m.id === cfg.founderId
+                ? 'Chef de Branche'
+                : !coreLineageIds.has(m.id)
+                ? 'Belle-famille'
+                : undefined,
           }
         );
       });

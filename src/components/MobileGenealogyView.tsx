@@ -30,7 +30,7 @@ import {
   getLifeDates,
   isPersonIncomplete
 } from '../data/wiciFamily';
-import { resolveBranchId } from '../utils/treeLayout';
+import { resolveBranchId, getSiblingGroups, getCoreLineageIds } from '../utils/treeLayout';
 
 interface MobileGenealogyViewProps {
   people: Person[];
@@ -67,6 +67,7 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
   const [expandedGenerations, setExpandedGenerations] = useState<Set<number>>(new Set([0, 1, 2]));
 
   const byId = useMemo(() => new Map(people.map((p) => [p.id, p])), [people]);
+  const coreLineageIds = useMemo(() => getCoreLineageIds(people), [people]);
 
   // Current person
   const currentPerson = byId.get(currentFocusId) || people[0];
@@ -118,19 +119,9 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
       .filter(Boolean) as Person[];
   }, [currentPerson, children, byId]);
 
-  const siblings = useMemo(() => {
-    if (!currentPerson || currentPerson.parents.length === 0) return [];
-    return people
-      .filter(
-        (p) =>
-          p.id !== currentPerson.id &&
-          (p.parents || []).some((pid) => currentPerson.parents.includes(pid))
-      )
-      .sort((a, b) => {
-        const ya = parseInt((a.birth || '').replace(/\D/g, ''), 10) || 9999;
-        const yb = parseInt((b.birth || '').replace(/\D/g, ''), 10) || 9999;
-        return ya - yb;
-      });
+  const { fullSiblings, halfSiblings } = useMemo(() => {
+    if (!currentPerson) return { fullSiblings: [], halfSiblings: [] };
+    return getSiblingGroups(currentPerson.parents || [], currentPerson.id, people);
   }, [currentPerson, people]);
 
   // Compute generation depth
@@ -168,7 +159,7 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
     const q = searchQuery.trim().toLowerCase();
     return people.filter((p) => {
       if (selectedBranch !== 'all') {
-        const bId = resolveBranchId(p.id, byId);
+        const bId = resolveBranchId(p.id, byId, people);
         if (bId !== selectedBranch && p.id !== selectedBranch) return false;
       }
       if (!q) return true;
@@ -400,9 +391,20 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
                         <p className="font-serif text-base font-medium text-[#1C1917] truncate leading-tight">
                           {getFullName(par)}
                         </p>
-                        <p className="text-xs text-[#857C70] font-mono mt-0.5">
-                          {getLifeDates(par)}
-                        </p>
+                        <div className="flex items-center gap-1.5 flex-wrap mt-0.5">
+                          <span className="text-xs text-[#857C70] font-mono">
+                            {getLifeDates(par)}
+                          </span>
+                          <span
+                            className={`text-[10px] px-1.5 py-0.2 rounded-full border font-medium ${
+                              coreLineageIds.has(par.id)
+                                ? 'bg-[#F7F3EB] text-[#8C7355] border-[#DFD2BE]'
+                                : 'bg-[#F4F3F1] text-[#6E665C] border-[#DEDAD2]'
+                            }`}
+                          >
+                            {coreLineageIds.has(par.id) ? 'Lignée de souche' : 'Belle-famille'}
+                          </span>
+                        </div>
                       </div>
                     </div>
                     <span className="text-xs font-medium text-[#8C7355] shrink-0 ml-2">
@@ -440,7 +442,11 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
               </button>
               <div className="flex-1 min-w-0">
                 <span className="text-[11px] uppercase tracking-wider text-[#8C7355] font-medium">
-                  {currentPerson.id === 'victoria' ? 'Matriarche de la famille' : 'Fiche active'}
+                  {currentPerson.id === 'victoria'
+                    ? 'Matriarche de la famille'
+                    : coreLineageIds.has(currentPerson.id)
+                    ? 'Lignée de souche'
+                    : 'Belle-famille'}
                 </span>
                 <h3 className="font-serif text-2xl font-medium text-[#1C1917] leading-tight mt-0.5">
                   {getFullName(currentPerson)}
@@ -605,29 +611,59 @@ export const MobileGenealogyView: React.FC<MobileGenealogyViewProps> = ({
           </div>
 
           {/* SECTION 5 : FRÈRES ET SŒURS */}
-          {siblings.length > 0 && (
-            <div className="bg-white border border-[#E4DDD3] rounded-2xl p-4 shadow-2xs space-y-2.5">
-              <span className="text-[11px] uppercase tracking-wider text-[#8C7A65] font-medium flex items-center gap-1.5">
-                <Users className="h-3.5 w-3.5" />
-                <span>Frères & Sœurs ({siblings.length})</span>
-              </span>
-              <div className="flex flex-wrap gap-2">
-                {siblings.map((sib) => (
-                  <button
-                    key={sib.id}
-                    type="button"
-                    onClick={() => navigateToPerson(sib.id)}
-                    className="min-h-[42px] px-3.5 bg-[#FAF8F5] border border-[#E0D7C9] text-xs text-[#1C1917] font-medium rounded-full active:bg-[#EAE4D8] flex items-center gap-1.5 shadow-2xs"
-                  >
-                    <span className="font-serif text-sm">{sib.first}</span>
-                    {sib.birth && (
-                      <span className="font-mono text-[10px] text-[#8C7A65]">
-                        ({sib.birth})
-                      </span>
-                    )}
-                  </button>
-                ))}
-              </div>
+          {(fullSiblings.length > 0 || halfSiblings.length > 0) && (
+            <div className="bg-white border border-[#E4DDD3] rounded-2xl p-4 shadow-2xs space-y-3">
+              {fullSiblings.length > 0 && (
+                <div className="space-y-2">
+                  <span className="text-[11px] uppercase tracking-wider text-[#8C7A65] font-medium flex items-center gap-1.5">
+                    <Users className="h-3.5 w-3.5" />
+                    <span>Frères & Sœurs ({fullSiblings.length})</span>
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {fullSiblings.map((sib) => (
+                      <button
+                        key={sib.id}
+                        type="button"
+                        onClick={() => navigateToPerson(sib.id)}
+                        className="min-h-[42px] px-3.5 bg-[#FAF8F5] border border-[#E0D7C9] text-xs text-[#1C1917] font-medium rounded-full active:bg-[#EAE4D8] flex items-center gap-1.5 shadow-2xs"
+                      >
+                        <span className="font-serif text-sm">{sib.first}</span>
+                        {sib.birth && (
+                          <span className="font-mono text-[10px] text-[#8C7A65]">
+                            ({sib.birth})
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {halfSiblings.length > 0 && (
+                <div className="space-y-2">
+                  <span className="text-[11px] uppercase tracking-wider text-[#8C7A65] font-medium flex items-center gap-1.5">
+                    <Users className="h-3.5 w-3.5" />
+                    <span>Demi-frères & Demi-sœurs ({halfSiblings.length})</span>
+                  </span>
+                  <div className="flex flex-wrap gap-2">
+                    {halfSiblings.map(({ person: sib }) => (
+                      <button
+                        key={sib.id}
+                        type="button"
+                        onClick={() => navigateToPerson(sib.id)}
+                        className="min-h-[42px] px-3.5 bg-[#FAF8F5] border border-dashed border-[#DFD6C7] text-xs text-[#3D3832] font-medium rounded-full active:bg-[#EAE4D8] flex items-center gap-1.5"
+                      >
+                        <span className="font-serif text-sm">{sib.first}</span>
+                        {sib.birth && (
+                          <span className="font-mono text-[10px] text-[#8C7A65]">
+                            ({sib.birth})
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

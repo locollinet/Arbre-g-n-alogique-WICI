@@ -476,7 +476,7 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
   };
 
   const renderPersonCard = (node: PositionedNode) => {
-    const { person, width, height, childCount, descendantCount, isCollapsed, branchId } = node;
+    const { person, width, height, childCount, descendantCount, isCollapsed, branchId, isInLaw } = node;
     const isDimmed = highlightedIds ? !highlightedIds.has(person.id) : false;
     const isHighlighted = highlightedIds ? highlightedIds.has(person.id) : false;
     const isFounder = person.id === 'victoria';
@@ -521,7 +521,9 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
           style={{
             borderColor: isHighlighted || isFounder ? branchPalette.border : undefined,
           }}
-          className={`relative h-full w-full bg-white rounded-lg border transition-all duration-150 flex ${
+          className={`relative h-full w-full rounded-lg border transition-all duration-150 flex ${
+            isInLaw ? 'bg-[#FCFBF8] border-dashed' : 'bg-white'
+          } ${
             settings.cardStyle === 'medallion'
               ? 'flex-col items-center justify-center text-center px-2.5 py-2'
               : 'items-center gap-3 px-3.5 py-2.5'
@@ -533,13 +535,18 @@ export const TreeCanvasView: React.FC<TreeCanvasViewProps> = ({
               : 'border-[#E2DAD0] hover:border-[#9A7B56] shadow-[0_2px_10px_rgba(28,25,23,0.04)] hover:shadow-[0_6px_20px_rgba(28,25,23,0.09)]'
           }`}
         >
-          {/* Subtle top branch color line */}
+          {/* Subtle top branch color line (dashed/muted if belle-famille lineage) */}
           <div
             className="absolute top-0 left-3 right-3 h-[2.5px] rounded-b-full opacity-75 group-hover:opacity-100 transition-opacity"
             style={{
-              backgroundColor: branchPalette.border,
+              backgroundColor: isInLaw ? '#B8B0A4' : branchPalette.border,
             }}
           />
+          {isInLaw && (
+            <span className="absolute -top-2 left-2.5 px-1.5 py-0.2 rounded-full bg-[#F2EFE9] border border-[#D8D0C4] text-[8.5px] uppercase tracking-wider text-[#6E665C] font-medium">
+              Belle-famille
+            </span>
+          )}
 
           {/* Avatar / Monogram with quick photo access */}
           {settings.showInitialsAvatar && settings.cardStyle !== 'minimal' && (

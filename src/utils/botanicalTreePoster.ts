@@ -13,6 +13,7 @@ export interface BotanicalTreeOptions {
   orientation: 'landscape' | 'portrait';
   title?: string;
   subtitle?: string;
+  showSpouses?: boolean;
 }
 
 interface Pt {
@@ -205,7 +206,7 @@ function leafUse(at: Pt, angleDeg: number, size: number, fill: string, opacity: 
 // Family structure
 // ---------------------------------------------------------------------------
 
-function buildFamilyTree(people: Person[]) {
+function buildFamilyTree(people: Person[], includeSpouses: boolean) {
   const byId = new Map(people.map((p) => [p.id, p]));
   const kids = new Map<string, Person[]>();
   for (const p of people) {
@@ -282,25 +283,27 @@ function buildFamilyTree(people: Person[]) {
   // Spouses and co-parents (people outside the bloodline).
   const founderSpouses: FounderSpouse[] = [];
   const others: Person[] = [];
-  for (const p of people) {
-    if (nodes.has(p.id)) continue;
-    const partners: string[] = [];
-    for (const k of kids.get(p.id) || []) {
-      for (const pid of k.parents || []) if (pid !== p.id && nodes.has(pid)) partners.push(pid);
-    }
-    for (const sid of p.spouses || []) if (nodes.has(sid)) partners.push(sid);
-    for (const q of people) if (nodes.has(q.id) && (q.spouses || []).includes(p.id)) partners.push(q.id);
+  if (includeSpouses) {
+    for (const p of people) {
+      if (nodes.has(p.id)) continue;
+      const partners: string[] = [];
+      for (const k of kids.get(p.id) || []) {
+        for (const pid of k.parents || []) if (pid !== p.id && nodes.has(pid)) partners.push(pid);
+      }
+      for (const sid of p.spouses || []) if (nodes.has(sid)) partners.push(sid);
+      for (const q of people) if (nodes.has(q.id) && (q.spouses || []).includes(p.id)) partners.push(q.id);
 
-    if (partners.includes(root.person.id)) {
-      const childNames = (kids.get(p.id) || [])
-        .filter((k) => (k.parents || []).includes(root.person.id))
-        .sort((a, b) => birthYear(a) - birthYear(b))
-        .map(shortFirst);
-      founderSpouses.push({ person: p, childNames, meanAngle: 90, pos: { x: 0, y: 0 } });
-    } else if (partners.length > 0) {
-      nodes.get(partners[0])!.spouses.push(p);
-    } else {
-      others.push(p);
+      if (partners.includes(root.person.id)) {
+        const childNames = (kids.get(p.id) || [])
+          .filter((k) => (k.parents || []).includes(root.person.id))
+          .sort((a, b) => birthYear(a) - birthYear(b))
+          .map(shortFirst);
+        founderSpouses.push({ person: p, childNames, meanAngle: 90, pos: { x: 0, y: 0 } });
+      } else if (partners.length > 0) {
+        nodes.get(partners[0])!.spouses.push(p);
+      } else {
+        others.push(p);
+      }
     }
   }
 
@@ -431,6 +434,9 @@ function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boole
         [a0, forkCenter + forkHalfGap],
         [forkCenter - forkHalfGap, a1],
       ];
+      // Upper canopy (Gen III+) can arch gently over a childless inner Gen-II leaf (e.g. Elsa)
+      // to close the top V-gap while strictly respecting the vertical center axis.
+      const upperCenterMargin = 2.6;
       groups.forEach((grp, gIdx) => {
         const [ga0, ga1] = ranges[gIdx];
         let grpGaps = 0;
@@ -439,11 +445,49 @@ function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boole
         }
         const grpTotal = grp.reduce((s, c) => s + c.weight, 0) + grpGaps;
         const grpUnit = (ga0 - ga1) / grpTotal;
+
+        let innerWithKidsIdx = -1;
+        if (gIdx === 0) {
+          for (let i = grp.length - 1; i >= 0; i--) {
+            if (grp[i].children.length > 0) {
+              innerWithKidsIdx = i;
+              break;
+            }
+          }
+        } else {
+          for (let i = 0; i < grp.length; i++) {
+            if (grp[i].children.length > 0) {
+              innerWithKidsIdx = i;
+              break;
+            }
+          }
+        }
+
         let cursor = ga0;
         for (let i = 0; i < grp.length; i++) {
           const c = grp[i];
           const span = c.weight * grpUnit;
-          assignAngles(c, cursor, cursor - span, true);
+          const cStart = cursor;
+          const cEnd = cursor - span;
+          assignAngles(c, cStart, cEnd, true);
+
+          if (i === innerWithKidsIdx) {
+            const baseAngle = c.angle;
+            if (gIdx === 0) {
+              const targetEnd = forkCenter + upperCenterMargin;
+              if (targetEnd < cEnd) {
+                assignAngles(c, cStart, targetEnd, true);
+                c.angle = baseAngle;
+              }
+            } else {
+              const targetStart = forkCenter - upperCenterMargin;
+              if (targetStart > cStart) {
+                assignAngles(c, targetStart, cEnd, true);
+                c.angle = baseAngle;
+              }
+            }
+          }
+
           cursor -= span;
           if (i < grp.length - 1) {
             cursor -= gapBetweenSiblings(n, c, grp[i + 1], true) * grpUnit;
@@ -580,9 +624,10 @@ export function buildBotanicalTreeSvg(
   settings: TreeSettings,
   options: BotanicalTreeOptions
 ): { svg: string; width: number; height: number } {
+  const includeSpouses = options.showSpouses ?? settings.showSpouses;
   const g = geometryFor(options.orientation);
   const { W, H, cx, crownY, groundY } = g;
-  const { root, nodes, founderSpouses, others } = buildFamilyTree(people);
+  const { root, nodes, founderSpouses, others } = buildFamilyTree(people, includeSpouses);
   const rand = seededRandom(`${people.length}-${root.person.id}`);
 
   const hasMultipleUnions = founderSpouses.length > 1;
@@ -1189,12 +1234,15 @@ export function buildBotanicalTreeSvg(
 
   // 5. Title cartouche, legends, frame
   const genCount = maxDepth + 1;
-  const years = people.map(birthYear).filter((y) => y < 9999);
+  const displayedPeople = includeSpouses
+    ? people
+    : all.map((n) => n.person);
+  const years = displayedPeople.map(birthYear).filter((y) => y < 9999);
   const since = years.length ? Math.min(...years) : undefined;
   const title = options.title || settings.familyName || 'Notre arbre de famille';
   const subtitle =
     options.subtitle ||
-    `${genCount} générations · ${people.length} membres${since ? ` · depuis ${since}` : ''}`;
+    `${genCount} générations · ${displayedPeople.length} membres${since ? ` · depuis ${since}` : ''}`;
   const ty = g.titleY;
   const titleSvg =
     `<text x="${f(cx)}" y="${f(ty - 150)}" text-anchor="middle" font-family="${SANS}" font-size="30" font-weight="700" letter-spacing="14" fill="${GOLD}">ARBRE GÉNÉALOGIQUE</text>` +

@@ -25,7 +25,13 @@ import {
   getLifeDates,
   isPersonIncomplete
 } from '../data/wiciFamily';
-import { getAncestorsSet, getDescendantsSet } from '../utils/treeLayout';
+import {
+  getAncestorsSet,
+  getCoreLineageIds,
+  getDescendantsSet,
+  getKnownPartnerIds,
+  getSiblingGroups
+} from '../utils/treeLayout';
 import { validatePeople } from '../utils/validateFamily';
 import { PhotoCropperModal, CropResult } from './PhotoCropperModal';
 import { PersonPhotoRecord } from '../firebase/photoService';
@@ -34,6 +40,7 @@ interface PersonDrawerProps {
   isOpen: boolean;
   personId: string | null; // null if closed, 'new' if creating new person
   preselectedParentId?: string | null;
+  preselectedParentIds?: string[];
   people: Person[];
   onClose: () => void;
   onSavePerson: (person: Person, childIdsToAttach?: string[]) => void;
@@ -41,6 +48,7 @@ interface PersonDrawerProps {
   onSelectPerson: (id: string) => void;
   onFocusBranch: (id: string) => void;
   onAddChildFor: (parentId: string) => void;
+  onAddSiblingFor?: (parentIds: string[]) => void;
   onSavePhoto?: (personId: string, result: CropResult) => Promise<void> | void;
   onRemovePhoto?: (personId: string) => Promise<void>;
   photosMap?: Record<string, PersonPhotoRecord>;
@@ -51,6 +59,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   isOpen,
   personId,
   preselectedParentId,
+  preselectedParentIds,
   people,
   onClose,
   onSavePerson,
@@ -58,6 +67,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   onSelectPerson,
   onFocusBranch,
   onAddChildFor,
+  onAddSiblingFor,
   onSavePhoto,
   onRemovePhoto,
   photosMap,
@@ -80,6 +90,8 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   const [photo, setPhoto] = useState<string>('');
   const [parentQuery, setParentQuery] = useState('');
   const [childQuery, setChildQuery] = useState('');
+  const [spouseQuery, setSpouseQuery] = useState('');
+  const [showSpousePicker, setShowSpousePicker] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -89,23 +101,36 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const preselectedParentIdsKey = (preselectedParentIds || []).join('|');
+
   useEffect(() => {
     setErrorMsg(null);
     setConfirmDelete(false);
     setParentQuery('');
     setChildQuery('');
+    setSpouseQuery('');
 
     if (isNew) {
       setMode('edit');
+      setShowSpousePicker(false);
+      const hasMultiPreselection = preselectedParentIds && preselectedParentIds.length > 0;
       const parentObj = preselectedParentId ? people.find((p) => p.id === preselectedParentId) : null;
+      const partnerIds = preselectedParentId ? getKnownPartnerIds(preselectedParentId, people) : [];
+      const initialParents = hasMultiPreselection
+        ? [...preselectedParentIds!]
+        : preselectedParentId
+        ? partnerIds.length === 1
+          ? [preselectedParentId, partnerIds[0]]
+          : [preselectedParentId]
+        : [];
       setFirst('');
-      setLast(parentObj?.last || '');
+      setLast(hasMultiPreselection ? '' : parentObj?.last || '');
       setBirth('');
       setDeath('');
       setLocation('');
       setOccupation('');
       setNotes('');
-      setParents(preselectedParentId ? [preselectedParentId] : []);
+      setParents(initialParents);
       setSpouses([]);
       setChildrenIds([]);
       setPhoto('');
@@ -120,17 +145,20 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
       setNotes(existingPerson.notes || '');
       setParents(existingPerson.parents || []);
       setSpouses(existingPerson.spouses || []);
+      setShowSpousePicker((existingPerson.spouses || []).length > 0);
       const currentKids = people
         .filter((p) => (p.parents || []).includes(existingPerson.id))
         .map((p) => p.id);
       setChildrenIds(currentKids);
       setPhoto(existingPerson.photo || '');
     }
-  }, [isOpen, personId, preselectedParentId]);
+  }, [isOpen, personId, preselectedParentId, preselectedParentIdsKey]);
 
   if (!isOpen || (!existingPerson && !isNew)) return null;
 
   const byId = new Map(people.map((p) => [p.id, p]));
+  const coreLineageIds = getCoreLineageIds(people);
+  const isExistingCoreLineage = existingPerson ? coreLineageIds.has(existingPerson.id) : true;
 
   // Family relationships for view mode
   const parentObjects = (existingPerson?.parents || [])
@@ -152,15 +180,20 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
     .map((id) => byId.get(id))
     .filter(Boolean) as Person[];
 
-  // Siblings
-  const siblingObjects =
-    existingPerson && existingPerson.parents.length > 0
-      ? people.filter(
-          (p) =>
-            p.id !== existingPerson.id &&
-            (p.parents || []).some((pid) => existingPerson.parents.includes(pid))
-        )
-      : [];
+  // Siblings separated cleanly into full siblings and half-siblings
+  const { fullSiblings, halfSiblings } = existingPerson
+    ? getSiblingGroups(existingPerson.parents || [], existingPerson.id, people)
+    : { fullSiblings: [], halfSiblings: [] };
+  const hasAnySiblings = fullSiblings.length > 0 || halfSiblings.length > 0;
+  const singleSharedHalfParent = (() => {
+    if (halfSiblings.length === 0) return null;
+    const sharedIds = new Set(
+      halfSiblings.flatMap((entry) => entry.sharedParents.map((sp) => sp.id))
+    );
+    if (sharedIds.size !== 1) return null;
+    const onlyId = Array.from(sharedIds)[0];
+    return byId.get(onlyId) || null;
+  })();
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -215,6 +248,27 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
     }
     setErrorMsg(null);
     setParents((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const selectCoParent = (partnerId: string, allPartnerIdsOfParent: string[]) => {
+    if (parents.includes(partnerId)) {
+      setErrorMsg(null);
+      setParents((prev) => prev.filter((id) => id !== partnerId));
+      return;
+    }
+    if (existingPerson) {
+      const desc = getDescendantsSet(people, existingPerson.id);
+      if (desc.has(partnerId)) {
+        setErrorMsg("Impossible de sélectionner un descendant comme parent (boucle généalogique).");
+        return;
+      }
+    }
+    setErrorMsg(null);
+    setParents((prev) => {
+      const otherPartners = new Set(allPartnerIdsOfParent.filter((id) => id !== partnerId));
+      const filtered = prev.filter((id) => !otherPartners.has(id));
+      return filtered.includes(partnerId) ? filtered : [...filtered, partnerId];
+    });
   };
 
   const toggleChild = (id: string) => {
@@ -285,6 +339,76 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
       getFullName(p).toLowerCase().includes(childQuery.toLowerCase().trim())
     )
     .sort((a, b) => getFullName(a).localeCompare(getFullName(b), 'fr'));
+
+  // Known co-parents for each selected parent (so multi-union parents like Victoria
+  // immediately propose Fiodor vs Aloïsi without searching the whole tree)
+  const coParentGroups = parents
+    .map((pid) => {
+      const parentObj = byId.get(pid);
+      if (!parentObj) return null;
+      const partnerIds = getKnownPartnerIds(pid, people).filter(
+        (id) => id !== existingPerson?.id
+      );
+      if (partnerIds.length === 0) return null;
+      if (partnerIds.length === 1 && parents.includes(partnerIds[0])) return null;
+      const partners = partnerIds
+        .map((partnerId) => {
+          const partner = byId.get(partnerId);
+          if (!partner) return null;
+          const sharedKids = people
+            .filter(
+              (p) =>
+                p.id !== existingPerson?.id &&
+                (p.parents || []).includes(pid) &&
+                (p.parents || []).includes(partnerId)
+            )
+            .sort(
+              (a, b) =>
+                (parseInt((a.birth || '').replace(/\D/g, ''), 10) || 9999) -
+                (parseInt((b.birth || '').replace(/\D/g, ''), 10) || 9999)
+            );
+          return { partner, sharedKids };
+        })
+        .filter(Boolean) as { partner: Person; sharedKids: Person[] }[];
+      if (partners.length === 0) return null;
+      return { parent: parentObj, partnerIds, partners };
+    })
+    .filter(Boolean) as {
+      parent: Person;
+      partnerIds: string[];
+      partners: { partner: Person; sharedKids: Person[] }[];
+    }[];
+
+  const editSiblings = getSiblingGroups(parents, existingPerson?.id ?? null, people);
+
+  const filteredSpouseCandidates = people
+    .filter((p) => p.id !== existingPerson?.id && !parents.includes(p.id) && !childrenIds.includes(p.id))
+    .filter((p) =>
+      getFullName(p).toLowerCase().includes(spouseQuery.toLowerCase().trim())
+    )
+    .sort((a, b) => getFullName(a).localeCompare(getFullName(b), 'fr'));
+
+  const toggleSpouse = (id: string) => {
+    setErrorMsg(null);
+    setSpouses((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const renderLineageBadge = (id: string, compact = false) => {
+    const isCore = coreLineageIds.has(id);
+    return (
+      <span
+        className={`inline-block rounded-full border font-sans font-medium ${
+          compact ? 'px-1.5 py-0 text-[9.5px]' : 'px-2 py-0.5 text-[10px]'
+        } ${
+          isCore
+            ? 'bg-[#F7F3EB] text-[#8C7355] border-[#DFD2BE]'
+            : 'bg-[#F4F3F1] text-[#6E665C] border-[#DEDAD2]'
+        }`}
+      >
+        {isCore ? 'Lignée de souche' : 'Belle-famille'}
+      </span>
+    );
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-stretch sm:justify-end bg-[#1C1917]/40 backdrop-blur-[2px] transition-opacity">
@@ -380,6 +504,13 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                       <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#4D7A58] bg-[#EEF5F0] border border-[#CDE3D2] px-2 py-0.5 rounded-2xs">
                         <CloudCheck className="h-3 w-3" />
                         <span>Cloud Firebase</span>
+                      </span>
+                    )}
+                    {!isExistingCoreLineage && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-sans font-medium text-[#6E665C] bg-[#F4F3F1] border border-[#DEDAD2] px-2 py-0.5 rounded-full">
+                        {spouseObjects.some((sp) => coreLineageIds.has(sp.id))
+                          ? 'Belle-famille · Conjoint'
+                          : 'Belle-famille'}
                       </span>
                     )}
                     {isPersonIncomplete(existingPerson) && (
@@ -519,13 +650,16 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                           onClick={() => onSelectPerson(par.id)}
                           className="flex items-center justify-between p-3 bg-white border border-[#E6DFD3] hover:border-[#B5A288] text-left transition-colors group"
                         >
-                          <div className="min-w-0">
+                          <div className="min-w-0 space-y-1">
                             <p className="font-serif text-base text-[#1C1917] truncate group-hover:text-[#8C7355]">
                               {getFullName(par)}
                             </p>
-                            <p className="text-[11px] text-[#8C7A65] font-mono tabular-nums">
-                              {getLifeDates(par)}
-                            </p>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[11px] text-[#8C7A65] font-mono tabular-nums">
+                                {getLifeDates(par)}
+                              </span>
+                              {renderLineageBadge(par.id, true)}
+                            </div>
                           </div>
                           <ChevronRight className="h-4 w-4 text-[#B5A898] group-hover:translate-x-0.5 transition-transform shrink-0" />
                         </button>
@@ -553,13 +687,16 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                           onClick={() => onSelectPerson(sp.id)}
                           className="flex items-center justify-between p-3 bg-white border border-[#E6DFD3] hover:border-[#B5A288] text-left transition-colors group"
                         >
-                          <div className="min-w-0">
+                          <div className="min-w-0 space-y-1">
                             <p className="font-serif text-base text-[#1C1917] truncate">
                               {getFullName(sp)}
                             </p>
-                            <p className="text-[11px] text-[#8C7A65] font-mono tabular-nums">
-                              {getLifeDates(sp)}
-                            </p>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-[11px] text-[#8C7A65] font-mono tabular-nums">
+                                {getLifeDates(sp)}
+                              </span>
+                              {renderLineageBadge(sp.id, true)}
+                            </div>
                           </div>
                           <ChevronRight className="h-4 w-4 text-[#B5A898] shrink-0" />
                         </button>
@@ -611,29 +748,90 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                 </div>
 
                 {/* Fratrie */}
-                {siblingObjects.length > 0 && (
-                  <div>
-                    <span className="text-xs font-medium text-[#6E665C] flex items-center gap-1.5 mb-2">
-                      <Users className="h-3.5 w-3.5 text-[#8C7A65]" />
-                      Frères & Sœurs ({siblingObjects.length})
-                    </span>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      {siblingObjects.map((sib) => (
-                        <button
-                          key={sib.id}
-                          type="button"
-                          onClick={() => onSelectPerson(sib.id)}
-                          className="flex items-center justify-between px-3 py-2 bg-[#F5F2EB] border border-[#E6DFD3] hover:bg-white text-left transition-colors"
-                        >
-                          <span className="font-serif text-sm text-[#1C1917] truncate">
-                            {getFullName(sib)}
+                {hasAnySiblings && (
+                  <div className="space-y-3">
+                    {fullSiblings.length > 0 && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs font-medium text-[#6E665C] flex items-center gap-1.5">
+                            <Users className="h-3.5 w-3.5 text-[#8C7A65]" />
+                            Frères & Sœurs ({fullSiblings.length})
                           </span>
-                          <span className="text-[11px] font-mono tabular-nums text-[#8C7A65] ml-2 shrink-0">
-                            {sib.birth || ''}
+                          {onAddSiblingFor && existingPerson.parents.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => onAddSiblingFor(existingPerson.parents)}
+                              className="text-xs text-[#8C7355] hover:text-[#1C1917] font-medium"
+                            >
+                              + Ajouter un frère / une sœur
+                            </button>
+                          )}
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {fullSiblings.map((sib) => (
+                            <button
+                              key={sib.id}
+                              type="button"
+                              onClick={() => onSelectPerson(sib.id)}
+                              className="flex items-center justify-between px-3 py-2 bg-[#F5F2EB] border border-[#E6DFD3] hover:bg-white text-left transition-colors"
+                            >
+                              <span className="font-serif text-sm text-[#1C1917] truncate">
+                                {getFullName(sib)}
+                              </span>
+                              <span className="text-[11px] font-mono tabular-nums text-[#8C7A65] ml-2 shrink-0">
+                                {sib.birth || ''}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {halfSiblings.length > 0 && (
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs font-medium text-[#8C7A65] flex items-center gap-1.5">
+                            <Users className="h-3.5 w-3.5 text-[#8C7A65]" />
+                            Demi-frères & Demi-sœurs
+                            {singleSharedHalfParent
+                              ? ` · via ${singleSharedHalfParent.first}`
+                              : ''}{' '}
+                            ({halfSiblings.length})
                           </span>
-                        </button>
-                      ))}
-                    </div>
+                          {fullSiblings.length === 0 &&
+                            onAddSiblingFor &&
+                            existingPerson.parents.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => onAddSiblingFor(existingPerson.parents)}
+                                className="text-xs text-[#8C7355] hover:text-[#1C1917] font-medium"
+                              >
+                                + Ajouter un frère / une sœur
+                              </button>
+                            )}
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {halfSiblings.map(({ person: sib, sharedParents }) => (
+                            <button
+                              key={sib.id}
+                              type="button"
+                              onClick={() => onSelectPerson(sib.id)}
+                              className="flex items-center justify-between px-3 py-2 bg-[#FAF8F5] border border-dashed border-[#DED6C8] hover:bg-white text-left transition-colors"
+                            >
+                              <span className="font-serif text-sm text-[#3D3832] truncate">
+                                {getFullName(sib)}
+                              </span>
+                              <span className="text-[11px] font-mono tabular-nums text-[#8C7A65] ml-2 shrink-0">
+                                {!singleSharedHalfParent && sharedParents.length > 0
+                                  ? `via ${sharedParents.map((p) => p.first).join(', ')} · `
+                                  : ''}
+                                {sib.birth || ''}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -824,12 +1022,96 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                           className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs bg-[#F0ECE3] text-[#1C1917] border border-[#D8CFC2]"
                         >
                           <span>{getFullName(pObj)}</span>
+                          {renderLineageBadge(pid, true)}
                           <X className="h-3 w-3 text-[#8C7A65]" />
                         </button>
                       );
                     })}
                   </div>
                 )}
+
+                {/* Quick second-parent / father selector for selected parents with known unions */}
+                {coParentGroups.map(({ parent, partnerIds, partners }) => {
+                  const hasSelectedPartner = partnerIds.some((id) => parents.includes(id));
+                  const needsDisambiguation = partnerIds.length >= 2 && !hasSelectedPartner;
+                  return (
+                    <div
+                      key={`coparent-${parent.id}`}
+                      className={`p-3 border space-y-2 ${
+                        needsDisambiguation
+                          ? 'bg-[#FAF6EE] border-[#DFCDB2]'
+                          : 'bg-[#FAF8F5] border-[#E6DFD3]'
+                      }`}
+                    >
+                      <span className="block text-[11px] font-medium text-[#6E665C]">
+                        {partnerIds.length >= 2
+                          ? needsDisambiguation
+                            ? `Préciser le second parent (avec ${parent.first}) :`
+                            : `Second parent avec ${parent.first} :`
+                          : `Rattacher l’autre parent (conjoint de ${parent.first}) :`}
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {partners.map(({ partner, sharedKids }) => {
+                          const selected = parents.includes(partner.id);
+                          const kidsSummary =
+                            sharedKids.length > 0
+                              ? `${sharedKids
+                                  .slice(0, 3)
+                                  .map((k) => k.first)
+                                  .join(', ')}${
+                                  sharedKids.length > 3 ? ` +${sharedKids.length - 3}` : ''
+                                }`
+                              : '';
+                          return (
+                            <button
+                              key={partner.id}
+                              type="button"
+                              onClick={() => selectCoParent(partner.id, partnerIds)}
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs border transition-colors ${
+                                selected
+                                  ? 'bg-[#1C1917] text-white border-[#1C1917] font-medium'
+                                  : 'bg-white hover:bg-[#F5F2EB] text-[#1C1917] border-[#D8CFC2]'
+                              }`}
+                            >
+                              {selected && <Check className="h-3 w-3 shrink-0" />}
+                              <span>{getFullName(partner)}</span>
+                              {kidsSummary && (
+                                <span
+                                  className={`text-[10px] ${
+                                    selected ? 'text-[#D8CFC2]' : 'text-[#8C7A65]'
+                                  }`}
+                                >
+                                  · {kidsSummary}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {/* Live sibling coherence summary based on selected parents */}
+                {parents.length > 0 &&
+                  (editSiblings.fullSiblings.length > 0 || editSiblings.halfSiblings.length > 0) && (
+                    <div className="px-3 py-2 bg-[#FAF8F5] border border-[#EDE7DC] text-[11px] text-[#6E665C] space-y-0.5">
+                      {editSiblings.fullSiblings.length > 0 && (
+                        <p>
+                          <span className="font-medium text-[#1C1917]">Frères &amp; sœurs :</span>{' '}
+                          {editSiblings.fullSiblings.map((s) => s.first).join(', ')}
+                        </p>
+                      )}
+                      {editSiblings.halfSiblings.length > 0 && (
+                        <p>
+                          <span className="font-medium text-[#8C7A65]">
+                            Demi-frères &amp; demi-sœurs :
+                          </span>{' '}
+                          {editSiblings.halfSiblings.map((h) => h.person.first).join(', ')}
+                        </p>
+                      )}
+                    </div>
+                  )}
 
                 <div className="relative">
                   <Search className="h-3.5 w-3.5 text-[#8C7A65] absolute left-3 top-1/2 -translate-y-1/2" />
@@ -845,6 +1127,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                 <div className="max-h-40 overflow-y-auto border border-[#E6DFD3] divide-y divide-[#F2EFE9] bg-[#FAF8F5]">
                   {filteredParentCandidates.map((cand) => {
                     const checked = parents.includes(cand.id);
+                    const isCoreCand = coreLineageIds.has(cand.id);
                     return (
                       <button
                         key={cand.id}
@@ -854,13 +1137,18 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                           checked ? 'bg-[#EFECE4] font-medium text-[#1C1917]' : 'hover:bg-white text-[#4A453E]'
                         }`}
                       >
-                        <span>
+                        <span className="truncate">
                           {getFullName(cand)}{' '}
                           {cand.birth && (
                             <span className="text-[#8C7A65] font-mono ml-1">({cand.birth})</span>
                           )}
                         </span>
-                        {checked && <Check className="h-3.5 w-3.5 text-[#8C7355]" />}
+                        <span className="flex items-center gap-1.5 shrink-0 ml-2">
+                          {!isCoreCand && (
+                            <span className="text-[10px] text-[#8E867B]">Belle-famille</span>
+                          )}
+                          {checked && <Check className="h-3.5 w-3.5 text-[#8C7355]" />}
+                        </span>
                       </button>
                     );
                   })}
@@ -929,6 +1217,83 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                     );
                   })}
                 </div>
+              </div>
+
+              {/* Lightweight Spouse / Union Selector (collapsed until clicked if none attached) */}
+              <div className="bg-white p-5 border border-[#E6DFD3] space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-medium text-[#575047] flex items-center gap-1.5">
+                    <Heart className="h-3.5 w-3.5 text-[#9A7B56]" />
+                    <span>Conjoint(s) / Union(s) ({spouses.length})</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setShowSpousePicker((v) => !v)}
+                    className="text-xs text-[#8C7355] hover:text-[#1C1917] font-medium"
+                  >
+                    {showSpousePicker ? 'Masquer' : '+ Associer un conjoint'}
+                  </button>
+                </div>
+
+                {spouses.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {spouses.map((sid) => {
+                      const sObj = byId.get(sid);
+                      if (!sObj) return null;
+                      return (
+                        <button
+                          key={sid}
+                          type="button"
+                          onClick={() => toggleSpouse(sid)}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs bg-[#F0ECE3] text-[#1C1917] border border-[#D8CFC2]"
+                        >
+                          <span>{getFullName(sObj)}</span>
+                          {renderLineageBadge(sid, true)}
+                          <X className="h-3 w-3 text-[#8C7A65]" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {showSpousePicker && (
+                  <>
+                    <div className="relative">
+                      <Search className="h-3.5 w-3.5 text-[#8C7A65] absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="search"
+                        value={spouseQuery}
+                        onChange={(e) => setSpouseQuery(e.target.value)}
+                        placeholder="Rechercher un conjoint dans l'arbre…"
+                        className="w-full h-9 pl-8 pr-3 bg-[#FAF8F5] border border-[#D8CFC2] text-xs text-[#1C1917] focus:outline-none focus:border-[#8C7355]"
+                      />
+                    </div>
+
+                    <div className="max-h-32 overflow-y-auto border border-[#E6DFD3] divide-y divide-[#F2EFE9] bg-[#FAF8F5]">
+                      {filteredSpouseCandidates.map((cand) => {
+                        const checked = spouses.includes(cand.id);
+                        return (
+                          <button
+                            key={cand.id}
+                            type="button"
+                            onClick={() => toggleSpouse(cand.id)}
+                            className={`w-full flex items-center justify-between px-3 py-2 text-xs text-left transition-colors ${
+                              checked ? 'bg-[#EFECE4] font-medium text-[#1C1917]' : 'hover:bg-white text-[#4A453E]'
+                            }`}
+                          >
+                            <span>
+                              {getFullName(cand)}{' '}
+                              {cand.birth && (
+                                <span className="text-[#8C7A65] font-mono ml-1">({cand.birth})</span>
+                              )}
+                            </span>
+                            {checked && <Check className="h-3.5 w-3.5 text-[#8C7355]" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
               </div>
             </form>
           )}

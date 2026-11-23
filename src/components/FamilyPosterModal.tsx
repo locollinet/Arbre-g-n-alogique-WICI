@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Printer,
   Download,
@@ -43,6 +43,7 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
 }) => {
   const [posterStyle, setPosterStyle] = useState<'tree' | 'gallery'>('tree');
   const [orientation, setOrientation] = useState<'landscape' | 'portrait'>('landscape');
+  const [showSpouses, setShowSpouses] = useState<boolean>(settings.showSpouses);
   const [customTitle, setCustomTitle] = useState('');
   const [customSubtitle, setCustomSubtitle] = useState('');
   const [previewZoom, setPreviewZoom] = useState(1);
@@ -50,14 +51,21 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (isOpen) {
+      setShowSpouses(settings.showSpouses);
+    }
+  }, [isOpen, settings.showSpouses]);
+
   const posterOptions = useMemo<PosterOptions>(
     () => ({
       orientation,
       style: posterStyle,
+      showSpouses,
       title: customTitle.trim() || settings.familyName || 'L’Arbre des Wici',
       subtitle: customSubtitle.trim() || undefined,
     }),
-    [orientation, posterStyle, customTitle, customSubtitle, settings.familyName]
+    [orientation, posterStyle, showSpouses, customTitle, customSubtitle, settings.familyName]
   );
 
   const posterData = useMemo(() => {
@@ -242,11 +250,29 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
               </div>
             </div>
 
-            {/* 3. Titre & Frontispice */}
+            {/* 3. Conjoints & Titre personnalisé */}
             <div className="space-y-3">
               <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
-                3. Titre personnalisé
+                3. Affichage &amp; Titre
               </label>
+
+              <label className="flex items-center justify-between gap-3 p-3 bg-[#FAF8F5] border border-[#E0D7C9] rounded-xl cursor-pointer hover:border-[#8C7355] transition-colors">
+                <div>
+                  <p className="text-xs font-semibold text-[#1C1917]">
+                    Afficher les conjoints (belle-famille)
+                  </p>
+                  <p className="text-[11px] text-[#7A7065]">
+                    Inclut Fiodor, Aloïsi et les conjoints sur l’affiche
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={showSpouses}
+                  onChange={(e) => setShowSpouses(e.target.checked)}
+                  className="h-4 w-4 accent-[#8C7355] shrink-0"
+                />
+              </label>
+
               <div>
                 <input
                   type="text"

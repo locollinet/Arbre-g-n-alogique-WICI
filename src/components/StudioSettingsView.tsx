@@ -112,7 +112,7 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
       .filter((p) => {
         if (onlyIncomplete && !isPersonIncomplete(p)) return false;
         if (branchFilter !== 'all') {
-          const bId = resolveBranchId(p.id, byId);
+          const bId = resolveBranchId(p.id, byId, people);
           if (bId !== branchFilter && p.id !== branchFilter) return false;
         }
         if (!q) return true;

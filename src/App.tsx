@@ -96,6 +96,7 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selectedPersonId, setSelectedPersonId] = useState<string | null>(null);
   const [preselectedParentId, setPreselectedParentId] = useState<string | null>(null);
+  const [preselectedParentIds, setPreselectedParentIds] = useState<string[]>([]);
 
   // Standalone Photo Cropper Atelier state
   const [cropperPersonId, setCropperPersonId] = useState<string | null>(null);
@@ -154,12 +155,22 @@ export default function App() {
     getAllPhotosFromIndexedDb()
       .then((localMap) => {
         if (Object.keys(localMap).length > 0) {
-          setPeople((prev) =>
-            prev.map((p) => {
+          setPeople((prev) => {
+            let changed = false;
+            const next = prev.map((p) => {
               const localPhoto = localMap[p.id]?.photoDataUrl;
-              return localPhoto ? { ...p, photo: localPhoto } : p;
-            })
-          );
+              if (localPhoto && !p.photo) {
+                changed = true;
+                return { ...p, photo: localPhoto };
+              }
+              return p;
+            });
+            if (changed) {
+              peopleRef.current = next;
+              return next;
+            }
+            return prev;
+          });
         }
       })
       .catch((err) => {
@@ -167,18 +178,43 @@ export default function App() {
       });
 
     // Deep auto-recovery of any photos from browser cache (localStorage or IndexedDB)
-    runFullPhotoRecovery(people).then(({ recoveredCount, updatedPeople }) => {
-      if (recoveredCount > 0) {
-        setPeople(updatedPeople);
-        notify(`${recoveredCount} photo(s) récupérée(s) du cache du navigateur !`);
-        // Immediately sync recovered photos up to Firestore so all family members get them
-        updatedPeople.forEach((p) => {
-          if (p.photo && !lastCloudPhotos.current[p.id]) {
-            void savePersonPhotoToFirestore({
-              personId: p.id,
-              photoDataUrl: p.photo,
-            }).catch(() => {});
+    // IMPORTANT: merge ONLY missing photos into current state (`prev`) so an async
+    // recovery never overwrites fresher members loaded from Firestore.
+    runFullPhotoRecovery(peopleRef.current).then(({ recoveredPhotos }) => {
+      const recoveredIds = Object.keys(recoveredPhotos);
+      if (recoveredIds.length === 0) return;
+
+      const missingInCloud = recoveredIds.filter(
+        (id) =>
+          recoveredPhotos[id] &&
+          !lastCloudPhotos.current[id] &&
+          peopleRef.current.some((p) => p.id === id)
+      );
+
+      setPeople((prev) => {
+        let changed = false;
+        const next = prev.map((p) => {
+          const salvaged = recoveredPhotos[p.id];
+          if (salvaged && !p.photo) {
+            changed = true;
+            return { ...p, photo: salvaged };
           }
+          return p;
+        });
+        if (changed) {
+          peopleRef.current = next;
+          return next;
+        }
+        return prev;
+      });
+
+      if (missingInCloud.length > 0) {
+        notify(`${missingInCloud.length} photo(s) récupérée(s) du cache du navigateur !`);
+        missingInCloud.forEach((personId) => {
+          void savePersonPhotoToFirestore({
+            personId,
+            photoDataUrl: recoveredPhotos[personId],
+          }).catch(() => {});
         });
       }
     });
@@ -233,10 +269,12 @@ export default function App() {
             // Merge cloud people with currently loaded photos without losing local portraits
             const prevPhotos = new Map(prev.map((p) => [p.id, p.photo]));
             const cloudPhotos = lastCloudPhotos.current;
-            return archiveRecord.people.map((cp) => ({
+            const next = archiveRecord.people.map((cp) => ({
               ...cp,
               photo: cloudPhotos[cp.id]?.photoDataUrl || prevPhotos.get(cp.id) || cp.photo,
             }));
+            peopleRef.current = next;
+            return next;
           });
         }
         if (archiveRecord.settings) {
@@ -422,19 +460,35 @@ export default function App() {
 
   const handleOpenPerson = (id: string) => {
     setPreselectedParentId(null);
+    setPreselectedParentIds([]);
     setSelectedPersonId(id);
     setDrawerOpen(true);
   };
 
   const handleOpenCreatePerson = (parentId?: string) => {
     setPreselectedParentId(parentId || null);
+    setPreselectedParentIds([]);
+    setSelectedPersonId('new');
+    setDrawerOpen(true);
+  };
+
+  const handleOpenCreateSibling = (parentIds: string[]) => {
+    setPreselectedParentId(null);
+    setPreselectedParentIds(parentIds);
     setSelectedPersonId('new');
     setDrawerOpen(true);
   };
 
   const handleSavePerson = (updated: Person, childIdsToAttach?: string[]) => {
     const prevList = peopleRef.current;
-    const isNewPerson = !prevList.some((p) => p.id === updated.id);
+    const prevPerson = prevList.find((p) => p.id === updated.id);
+    const isNewPerson = !prevPerson;
+    const prevSpouses = new Set(prevPerson?.spouses || []);
+    const nextSpouses = new Set(updated.spouses || []);
+    const spousesChanged =
+      prevSpouses.size !== nextSpouses.size ||
+      Array.from(nextSpouses).some((id) => !prevSpouses.has(id));
+
     let nextList = isNewPerson
       ? [...prevList, updated]
       : prevList.map((p) => (p.id === updated.id ? updated : p));
@@ -449,6 +503,22 @@ export default function App() {
         }
         if (!childSet.has(p.id) && currentlyHasParent) {
           return { ...p, parents: (p.parents || []).filter((id) => id !== updated.id) };
+        }
+        return p;
+      });
+    }
+
+    if (spousesChanged) {
+      nextList = nextList.map((p) => {
+        if (p.id === updated.id) return p;
+        const shouldLink = nextSpouses.has(p.id);
+        const wasLinked = prevSpouses.has(p.id);
+        const hasBackLink = (p.spouses || []).includes(updated.id);
+        if (shouldLink && !hasBackLink) {
+          return { ...p, spouses: [...(p.spouses || []), updated.id] };
+        }
+        if (!shouldLink && wasLinked && hasBackLink) {
+          return { ...p, spouses: (p.spouses || []).filter((id) => id !== updated.id) };
         }
         return p;
       });
@@ -886,6 +956,7 @@ export default function App() {
         isOpen={drawerOpen}
         personId={selectedPersonId}
         preselectedParentId={preselectedParentId}
+        preselectedParentIds={preselectedParentIds}
         people={people}
         onClose={() => setDrawerOpen(false)}
         onSavePerson={handleSavePerson}
@@ -897,6 +968,7 @@ export default function App() {
           setActiveTab('tree');
         }}
         onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
+        onAddSiblingFor={(parentIds) => handleOpenCreateSibling(parentIds)}
         onSavePhoto={handleSavePersonPhoto}
         onRemovePhoto={handleRemovePersonPhoto}
         photosMap={photosMap}

@@ -13,6 +13,7 @@ export interface PositionedNode {
   descendantCount: number;
   isCollapsed: boolean;
   coParents: Person[];
+  isInLaw?: boolean;
 }
 
 export interface PositionedPartner {
@@ -104,7 +105,33 @@ export function getAncestorsSet(people: Person[], targetId: string): Set<string>
   return set;
 }
 
-export function resolveBranchId(personId: string, byId: Map<string, Person>): string {
+export function getCoreLineageIds(people: Person[], focusRootId = 'victoria'): Set<string> {
+  if (people.length === 0) return new Set();
+  const byId = new Map(people.map((p) => [p.id, p]));
+  if (byId.has(focusRootId)) {
+    return getDescendantsSet(people, focusRootId);
+  }
+  const parentless = people.filter(
+    (p) => !(p.parents || []).some((pid) => byId.has(pid) && pid !== p.id)
+  );
+  const candidates = parentless.length > 0 ? parentless : people;
+  let bestId = candidates[0].id;
+  let bestSize = -1;
+  for (const cand of candidates) {
+    const size = getDescendantsSet(people, cand.id).size;
+    if (size > bestSize) {
+      bestSize = size;
+      bestId = cand.id;
+    }
+  }
+  return getDescendantsSet(people, bestId);
+}
+
+export function isCoreLineagePerson(personId: string, people: Person[]): boolean {
+  return getCoreLineageIds(people).has(personId);
+}
+
+function resolveBranchIdFromParents(personId: string, byId: Map<string, Person>): string {
   const mainBranches = new Set(['lydia', 'flore', 'peter', 'therese', 'regine']);
   let currentId: string | undefined = personId;
   const visited = new Set<string>();
@@ -118,6 +145,132 @@ export function resolveBranchId(personId: string, byId: Map<string, Person>): st
     currentId = nextParent;
   }
   return 'root';
+}
+
+export function resolveBranchId(
+  personId: string,
+  byId: Map<string, Person>,
+  people?: Person[]
+): string {
+  const direct = resolveBranchIdFromParents(personId, byId);
+  if (direct !== 'root' || personId === 'victoria') return direct;
+
+  // If this person is a spouse/in-law connected into a single main branch,
+  // associate them with that branch (while Fiodor/Aloïsi spanning multiple stay 'root').
+  const person = byId.get(personId);
+  if (!person) return 'root';
+  const list = people || Array.from(byId.values());
+  const linkedBranches = new Set<string>();
+
+  for (const sid of person.spouses || []) {
+    const b = resolveBranchIdFromParents(sid, byId);
+    if (b !== 'root') linkedBranches.add(b);
+  }
+  for (const q of list) {
+    if ((q.spouses || []).includes(personId)) {
+      const b = resolveBranchIdFromParents(q.id, byId);
+      if (b !== 'root') linkedBranches.add(b);
+    }
+    if ((q.parents || []).includes(personId)) {
+      const b = resolveBranchIdFromParents(q.id, byId);
+      if (b !== 'root') linkedBranches.add(b);
+    }
+  }
+
+  return linkedBranches.size === 1 ? Array.from(linkedBranches)[0] : 'root';
+}
+
+function getBirthSortKey(p: Person): number {
+  return parseInt((p.birth || '').replace(/\D/g, ''), 10) || 9999;
+}
+
+/**
+ * Returns deduplicated partner/co-parent IDs for a given person, combining
+ * explicit `spouses` links (either direction) and co-parents from shared children.
+ */
+export function getKnownPartnerIds(personId: string, people: Person[]): string[] {
+  const byId = new Map(people.map((p) => [p.id, p]));
+  const person = byId.get(personId);
+  if (!person) return [];
+
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const add = (id: string) => {
+    if (id !== personId && byId.has(id) && !seen.has(id)) {
+      seen.add(id);
+      result.push(id);
+    }
+  };
+
+  for (const sid of person.spouses || []) add(sid);
+  for (const q of people) {
+    if ((q.spouses || []).includes(personId)) add(q.id);
+  }
+  for (const c of people) {
+    if ((c.parents || []).includes(personId)) {
+      for (const pid of c.parents || []) add(pid);
+    }
+  }
+
+  return result;
+}
+
+export interface HalfSiblingEntry {
+  person: Person;
+  sharedParents: Person[];
+}
+
+export interface SiblingGroups {
+  fullSiblings: Person[];
+  halfSiblings: HalfSiblingEntry[];
+}
+
+/**
+ * Separates full siblings (identical parent set) from half-siblings (share at
+ * least one parent but differ on the other), both sorted chronologically.
+ */
+export function getSiblingGroups(
+  parentIds: string[],
+  excludePersonId: string | null,
+  people: Person[]
+): SiblingGroups {
+  const byId = new Map(people.map((p) => [p.id, p]));
+  const myParents = Array.from(new Set(parentIds)).filter((id) => byId.has(id));
+  if (myParents.length === 0) {
+    return { fullSiblings: [], halfSiblings: [] };
+  }
+  const myParentSet = new Set(myParents);
+
+  const fullSiblings: Person[] = [];
+  const halfSiblings: HalfSiblingEntry[] = [];
+
+  for (const other of people) {
+    if (other.id === excludePersonId) continue;
+    const otherParents = Array.from(new Set(other.parents || [])).filter((id) => byId.has(id));
+    const sharedIds = otherParents.filter((pid) => myParentSet.has(pid));
+    if (sharedIds.length === 0) continue;
+
+    const exactSameParents =
+      myParentSet.size === otherParents.length &&
+      otherParents.every((pid) => myParentSet.has(pid));
+
+    if (exactSameParents) {
+      fullSiblings.push(other);
+    } else {
+      halfSiblings.push({
+        person: other,
+        sharedParents: sharedIds.map((id) => byId.get(id)!).filter(Boolean),
+      });
+    }
+  }
+
+  const byChronology = (a: Person, b: Person) =>
+    getBirthSortKey(a) - getBirthSortKey(b);
+
+  fullSiblings.sort(byChronology);
+  halfSiblings.sort((a, b) => byChronology(a.person, b.person));
+
+  return { fullSiblings, halfSiblings };
 }
 
 export function computeTreeLayout(
@@ -155,15 +308,21 @@ export function computeTreeLayout(
   const activeList = people.filter((p) => allowedIds.has(p.id));
   const activeSet = new Set(activeList.map((p) => p.id));
 
+  const coreSet = getCoreLineageIds(
+    activeList,
+    focusBranch !== 'all' && activeSet.has(focusBranch) ? focusBranch : 'victoria'
+  );
+
   const childrenMap = new Map<string, Person[]>();
   activeList.forEach((p) => childrenMap.set(p.id, []));
 
   const primaryParentOf = new Map<string, string>();
   const coParentIds = new Set<string>();
+  const childlessSpousesOf = new Map<string, Person[]>();
 
-  // Identify who is a lineage node vs a spouse/co-parent medallion
+  // Identify who is a lineage node vs a spouse/co-parent medallion (belle-famille)
   for (const p of activeList) {
-    if (p.id === focusBranch || p.id === 'victoria') continue;
+    if (p.id === focusBranch || p.id === 'victoria' || coreSet.has(p.id)) continue;
     const hasParentsInTree = (p.parents || []).some((pid) => activeSet.has(pid));
     if (hasParentsInTree) continue;
 
@@ -172,7 +331,7 @@ export function computeTreeLayout(
       const allKidsHaveOtherPrimary = myKids.every((k) =>
         (k.parents || []).some((otherId) => {
           if (otherId === p.id || !activeSet.has(otherId)) return false;
-          if (otherId === 'victoria' || otherId === focusBranch) return true;
+          if (coreSet.has(otherId) || otherId === 'victoria' || otherId === focusBranch) return true;
           const otherPerson = byId.get(otherId);
           return (otherPerson?.parents || []).some((gp) => activeSet.has(gp));
         })
@@ -180,29 +339,51 @@ export function computeTreeLayout(
       if (allKidsHaveOtherPrimary) {
         coParentIds.add(p.id);
       }
+    } else {
+      // Childless explicit spouse attached to a core-lineage member
+      const explicitCoreSpouse = activeList.find(
+        (candidate) =>
+          coreSet.has(candidate.id) &&
+          ((p.spouses || []).includes(candidate.id) || (candidate.spouses || []).includes(p.id))
+      );
+      if (explicitCoreSpouse) {
+        coParentIds.add(p.id);
+        if (!childlessSpousesOf.has(explicitCoreSpouse.id)) {
+          childlessSpousesOf.set(explicitCoreSpouse.id, []);
+        }
+        childlessSpousesOf.get(explicitCoreSpouse.id)!.push(p);
+      }
     }
   }
 
-  // Assign each child to its primary tree parent
+  // Assign each child to its primary tree parent (always preferring Victoria's bloodline)
   for (const p of activeList) {
     if (coParentIds.has(p.id)) continue;
     const validParents = (p.parents || []).filter(
       (pid) => activeSet.has(pid) && pid !== p.id && !coParentIds.has(pid)
     );
-    const chosenParent = validParents.includes('victoria') ? 'victoria' : validParents[0];
+    const chosenParent =
+      validParents.find((pid) => pid === 'victoria') ||
+      validParents.find((pid) => coreSet.has(pid)) ||
+      validParents[0];
     if (chosenParent && childrenMap.has(chosenParent)) {
       childrenMap.get(chosenParent)!.push(p);
       primaryParentOf.set(p.id, chosenParent);
     }
   }
 
-  // Sort children chronologically by birth year where available
-  for (const [, kids] of childrenMap.entries()) {
-    kids.sort((a, b) => {
-      const ya = parseInt((a.birth || '').replace(/\D/g, ''), 10) || 9999;
-      const yb = parseInt((b.birth || '').replace(/\D/g, ''), 10) || 9999;
-      return ya - yb;
-    });
+  // Sort children chronologically and keep each co-parent union contiguous
+  // so undated or later children never split an existing union medallion.
+  for (const [parentId, kids] of childrenMap.entries()) {
+    kids.sort((a, b) => getBirthSortKey(a) - getBirthSortKey(b));
+    const grouped = new Map<string, Person[]>();
+    for (const k of kids) {
+      const coParentKey =
+        (k.parents || []).find((pid) => pid !== parentId && byId.has(pid)) || '';
+      if (!grouped.has(coParentKey)) grouped.set(coParentKey, []);
+      grouped.get(coParentKey)!.push(k);
+    }
+    childrenMap.set(parentId, Array.from(grouped.values()).flat());
   }
 
   // Precompute total descendants count for each person
@@ -243,10 +424,10 @@ export function computeTreeLayout(
     return sameUnion;
   }
 
-  // Find root nodes
-  const roots = activeList.filter(
-    (p) => !coParentIds.has(p.id) && !primaryParentOf.has(p.id)
-  );
+  // Find root nodes (core bloodline roots first, then any separate belle-famille roots)
+  const roots = activeList
+    .filter((p) => !coParentIds.has(p.id) && !primaryParentOf.has(p.id))
+    .sort((a, b) => Number(coreSet.has(b.id)) - Number(coreSet.has(a.id)));
 
   // Measure span of each subtree along the breadth axis (X in vertical, Y in horizontal)
   const nodeUnitSpan = isHorizontal ? cardHeight : cardWidth;
@@ -263,7 +444,10 @@ export function computeTreeLayout(
     }
 
     if (shouldStackChildrenVertically(id, depth, kids)) {
-      const stackedSpan = cardWidth + stackSpineIndent;
+      const hasSpouseOnStacked =
+        settings.showSpouses &&
+        kids.some((k) => (childlessSpousesOf.get(k.id)?.length || 0) > 0);
+      const stackedSpan = cardWidth + stackSpineIndent + (hasSpouseOnStacked ? 184 : 0);
       subtreeSpan.set(id, stackedSpan);
       kids.forEach((k) => subtreeSpan.set(k.id, nodeUnitSpan));
       return stackedSpan;
@@ -318,7 +502,7 @@ export function computeTreeLayout(
       .map((id) => byId.get(id)!)
       .filter(Boolean);
 
-    const branchId = resolveBranchId(person.id, byId);
+    const branchId = resolveBranchId(person.id, byId, activeList);
 
     nodes.push({
       id: person.id,
@@ -333,6 +517,7 @@ export function computeTreeLayout(
       descendantCount: descendantCountMap.get(person.id) || 0,
       isCollapsed,
       coParents: coParentsList,
+      isInLaw: !coreSet.has(person.id),
     });
   }
 
@@ -352,9 +537,15 @@ export function computeTreeLayout(
 
     if (isStacked) {
       // Parent centered at top of column; children stacked vertically below with a left spine
-      const parentX = centerBreadth - cardWidth / 2;
+      const hasSpouseOnStacked =
+        settings.showSpouses &&
+        visibleKids.some((k) => (childlessSpousesOf.get(k.id)?.length || 0) > 0);
+      const columnCenter = hasSpouseOnStacked
+        ? startBreadth + (cardWidth + stackSpineIndent) / 2
+        : centerBreadth;
+      const parentX = columnCenter - cardWidth / 2;
       const parentY = levelCoord;
-      const branchId = resolveBranchId(person.id, byId);
+      const branchId = resolveBranchId(person.id, byId, activeList);
 
       pushPersonNode(person, parentX, parentY, depth, allKids, isCollapsed);
 
@@ -413,7 +604,7 @@ export function computeTreeLayout(
         const ky = childStartLevelY + idx * (cardHeight + stackVerticalGap);
         const kAllKids = childrenMap.get(k.id) || [];
         const kCollapsed = collapsedIds.has(k.id);
-        const childBranch = resolveBranchId(k.id, byId);
+        const childBranch = resolveBranchId(k.id, byId, activeList);
 
         pushPersonNode(k, childCardX, ky, depth + 1, kAllKids, kCollapsed);
 
@@ -430,6 +621,37 @@ export function computeTreeLayout(
           spineX,
           elbowY,
         });
+
+        if (settings.showSpouses) {
+          const childSpouses = childlessSpousesOf.get(k.id) || [];
+          childSpouses.forEach((sp, spIdx) => {
+            const pw = 168;
+            const ph = 36;
+            const px = childCardX + cardWidth + 16;
+            const py = ky + (cardHeight - ph) / 2 + spIdx * (ph + 6);
+            partners.push({
+              id: `${k.id}-spouse-${sp.id}`,
+              person: sp,
+              primaryParentId: k.id,
+              x: px,
+              y: py,
+              width: pw,
+              height: ph,
+              depth: depth + 1,
+            });
+            edges.push({
+              id: `e-${k.id}-spouse-${sp.id}`,
+              fromId: k.id,
+              toId: sp.id,
+              x1: childCardX + cardWidth,
+              y1: ky + cardHeight / 2,
+              x2: px,
+              y2: py + ph / 2,
+              branchId: childBranch,
+              isPartnerLink: true,
+            });
+          });
+        }
       });
 
       return centerBreadth;
@@ -476,9 +698,44 @@ export function computeTreeLayout(
 
     const x = isHorizontal ? levelCoord : centerBreadth - cardWidth / 2;
     const y = isHorizontal ? centerBreadth - cardHeight / 2 : levelCoord;
-    const branchId = resolveBranchId(person.id, byId);
+    const branchId = resolveBranchId(person.id, byId, activeList);
 
     pushPersonNode(person, x, y, depth, allKids, isCollapsed);
+
+    if (visibleKids.length === 0 && settings.showSpouses) {
+      const leafSpouses = childlessSpousesOf.get(person.id) || [];
+      leafSpouses.forEach((sp, spIdx) => {
+        const pw = 168;
+        const ph = 36;
+        const px = isHorizontal
+          ? x + cardWidth + 16
+          : x + cardWidth / 2 - pw / 2;
+        const py = isHorizontal
+          ? y + (cardHeight - ph) / 2 + spIdx * (ph + 6)
+          : y + cardHeight + 14 + spIdx * (ph + 6);
+        partners.push({
+          id: `${person.id}-spouse-${sp.id}`,
+          person: sp,
+          primaryParentId: person.id,
+          x: px,
+          y: py,
+          width: pw,
+          height: ph,
+          depth,
+        });
+        edges.push({
+          id: `e-${person.id}-spouse-${sp.id}`,
+          fromId: person.id,
+          toId: sp.id,
+          x1: isHorizontal ? x + cardWidth : x + cardWidth / 2,
+          y1: isHorizontal ? y + cardHeight / 2 : y + cardHeight,
+          x2: isHorizontal ? px : px + pw / 2,
+          y2: isHorizontal ? py + ph / 2 : py,
+          branchId,
+          isPartnerLink: true,
+        });
+      });
+    }
 
     // Group visible children by their secondary parent (if any) so we can show union medallions cleanly
     if (visibleKids.length > 0) {
@@ -544,7 +801,7 @@ export function computeTreeLayout(
           const childLevelCoord = (isHorizontal ? padX : padY) + (depth + 1) * levelStep;
           const cx = isHorizontal ? childLevelCoord : center;
           const cy = isHorizontal ? center : childLevelCoord;
-          const childBranch = resolveBranchId(child.id, byId);
+          const childBranch = resolveBranchId(child.id, byId, activeList);
 
           edges.push({
             id: `e-${person.id}-${child.id}`,
