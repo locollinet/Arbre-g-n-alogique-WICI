@@ -32,6 +32,7 @@ interface TNode {
   pos: Pt;
   lineage: number;
   spouses: Person[];
+  coParentId?: string;
 }
 
 interface FounderSpouse {
@@ -282,6 +283,33 @@ function buildFamilyTree(people: Person[]) {
     }
   }
 
+  // Tag each Gen-II branch with its co-parent (founder spouse) and keep unions cleanly grouped
+  const founderSpouseIds = new Set(founderSpouses.map((s) => s.person.id));
+  for (const c of root.children) {
+    const coId = (c.person.parents || []).find((pid) => pid !== root.person.id && founderSpouseIds.has(pid));
+    if (coId) c.coParentId = coId;
+  }
+  if (founderSpouses.length > 1) {
+    const unionFirstYear = new Map<string, number>();
+    for (const c of root.children) {
+      const key = c.coParentId || '__other__';
+      const y = birthYear(c.person);
+      const prev = unionFirstYear.get(key);
+      if (prev === undefined || y < prev) unionFirstYear.set(key, y);
+    }
+    root.children.sort((a, b) => {
+      const ka = a.coParentId || '__other__';
+      const kb = b.coParentId || '__other__';
+      if (ka !== kb) {
+        return (unionFirstYear.get(ka) ?? 9999) - (unionFirstYear.get(kb) ?? 9999);
+      }
+      return (
+        birthYear(a.person) - birthYear(b.person) ||
+        (orderIndex.get(a.person.id) ?? 0) - (orderIndex.get(b.person.id) ?? 0)
+      );
+    });
+  }
+
   return { root, nodes, founderSpouses, others, kids };
 }
 
@@ -324,33 +352,103 @@ function geometryFor(orientation: 'landscape' | 'portrait'): Geometry {
   };
 }
 
-function computeWeights(n: TNode): void {
+function gapBetweenSiblings(parent: TNode, left: TNode, right: TNode, hasMultipleUnions: boolean): number {
+  if (parent.depth === 0) {
+    if (!hasMultipleUnions) return 0.95;
+    if (left.coParentId !== right.coParentId) return 2.55;
+    if (left.children.length === 0 || right.children.length === 0) return 0.55;
+    return 0.78;
+  }
+  return parent.depth === 1 ? 0.28 : 0.16;
+}
+
+function computeWeights(n: TNode, hasMultipleUnions: boolean): void {
   if (n.children.length === 0) {
     n.leaves = 1;
     n.weight = n.depth <= 2 ? 1.2 : 1.0;
     return;
   }
-  n.children.forEach(computeWeights);
-  const gap = n.depth === 0 ? 0.95 : n.depth === 1 ? 0.28 : 0.16;
+  n.children.forEach((c) => computeWeights(c, hasMultipleUnions));
   n.leaves = n.children.reduce((s, c) => s + c.leaves, 0);
-  const childSum = n.children.reduce((s, c) => s + c.weight, 0) + gap * (n.children.length - 1);
+  let gapsSum = 0;
+  for (let i = 0; i < n.children.length - 1; i++) {
+    gapsSum += gapBetweenSiblings(n, n.children[i], n.children[i + 1], hasMultipleUnions);
+  }
+  const childSum = n.children.reduce((s, c) => s + c.weight, 0) + gapsSum;
   const minByDepth = n.depth === 1 ? 1.8 : n.depth === 2 ? 1.2 : 1.0;
   n.weight = Math.max(minByDepth, childSum);
 }
 
-function assignAngles(n: TNode, a0: number, a1: number): void {
+function assignAngles(n: TNode, a0: number, a1: number, hasMultipleUnions: boolean): void {
   if (n.children.length === 0) {
     n.angle = (a0 + a1) / 2;
     return;
   }
-  const gap = n.depth === 0 ? 0.95 : n.depth === 1 ? 0.28 : 0.16;
-  const rawTotal = n.children.reduce((s, c) => s + c.weight, 0) + gap * (n.children.length - 1);
+
+  // When the founder has two distinct unions (e.g. Victoria & Fiodor vs Victoria & Aloïsi),
+  // keep the fork cleanly centered over the trunk axis so each union owns its side of the tree.
+  if (n.depth === 0 && hasMultipleUnions) {
+    const groups: TNode[][] = [];
+    for (const c of n.children) {
+      const prev = groups[groups.length - 1];
+      if (prev && prev[0].coParentId === c.coParentId) {
+        prev.push(c);
+      } else {
+        groups.push([c]);
+      }
+    }
+    if (groups.length === 2) {
+      const midAngle = (a0 + a1) / 2; // 90 deg (center above trunk)
+      const forkHalfGap = 5; // 10 deg open V-fork over the trunk
+      const wLeft = groups[0].reduce((s, c) => s + c.weight, 0);
+      const wRight = groups[1].reduce((s, c) => s + c.weight, 0);
+      const ratio = wLeft / Math.max(1, wLeft + wRight);
+      // Allow a gentle ±2° shift toward balance while keeping the fork squarely over the trunk
+      const shift = Math.max(-2, Math.min(2, (0.5 - ratio) * 28));
+      const forkCenter = midAngle + shift;
+      const ranges: [number, number][] = [
+        [a0, forkCenter + forkHalfGap],
+        [forkCenter - forkHalfGap, a1],
+      ];
+      groups.forEach((grp, gIdx) => {
+        const [ga0, ga1] = ranges[gIdx];
+        let grpGaps = 0;
+        for (let i = 0; i < grp.length - 1; i++) {
+          grpGaps += gapBetweenSiblings(n, grp[i], grp[i + 1], true);
+        }
+        const grpTotal = grp.reduce((s, c) => s + c.weight, 0) + grpGaps;
+        const grpUnit = (ga0 - ga1) / grpTotal;
+        let cursor = ga0;
+        for (let i = 0; i < grp.length; i++) {
+          const c = grp[i];
+          const span = c.weight * grpUnit;
+          assignAngles(c, cursor, cursor - span, true);
+          cursor -= span;
+          if (i < grp.length - 1) {
+            cursor -= gapBetweenSiblings(n, c, grp[i + 1], true) * grpUnit;
+          }
+        }
+      });
+      n.angle = midAngle;
+      return;
+    }
+  }
+
+  let gapsSum = 0;
+  for (let i = 0; i < n.children.length - 1; i++) {
+    gapsSum += gapBetweenSiblings(n, n.children[i], n.children[i + 1], hasMultipleUnions);
+  }
+  const rawTotal = n.children.reduce((s, c) => s + c.weight, 0) + gapsSum;
   const unit = (a0 - a1) / rawTotal;
   let cursor = a0;
-  for (const c of n.children) {
+  for (let i = 0; i < n.children.length; i++) {
+    const c = n.children[i];
     const span = c.weight * unit;
-    assignAngles(c, cursor, cursor - span);
-    cursor -= span + gap * unit;
+    assignAngles(c, cursor, cursor - span, hasMultipleUnions);
+    cursor -= span;
+    if (i < n.children.length - 1) {
+      cursor -= gapBetweenSiblings(n, c, n.children[i + 1], hasMultipleUnions) * unit;
+    }
   }
   n.angle = (n.children[0].angle + n.children[n.children.length - 1].angle) / 2;
 }
@@ -466,9 +564,12 @@ export function buildBotanicalTreeSvg(
   const { root, nodes, founderSpouses, others } = buildFamilyTree(people);
   const rand = seededRandom(`${people.length}-${root.person.id}`);
 
+  const hasMultipleUnions = founderSpouses.length > 1;
+  const founderSpouseById = new Map(founderSpouses.map((s) => [s.person.id, s]));
+
   // 1. Angular & radial layout of the crown
-  computeWeights(root);
-  assignAngles(root, g.angStart, g.angEnd);
+  computeWeights(root, hasMultipleUnions);
+  assignAngles(root, g.angStart, g.angEnd, hasMultipleUnions);
   root.children.forEach((c, i) => {
     const mark = (n: TNode) => {
       n.lineage = i;
@@ -538,6 +639,75 @@ export function buildBotanicalTreeSvg(
 
   const thickness = (n: TNode) => 14 + 11 * Math.sqrt(n.leaves);
 
+  // Compute twin grand boughs (charpentières) when the founder has two distinct unions
+  interface UnionBough {
+    spouseId: string;
+    spouse: FounderSpouse;
+    side: -1 | 1;
+    p0: Pt;
+    p1: Pt;
+    p2: Pt;
+    tip: Pt;
+    plaqueCenter: Pt;
+    w0: number;
+    w1: number;
+    tangent: Pt;
+  }
+  const unionBoughs = new Map<string, UnionBough>();
+  const unionGroups: string[] = [];
+  if (hasMultipleUnions) {
+    for (const c of root.children) {
+      if (c.coParentId && !unionGroups.includes(c.coParentId)) {
+        unionGroups.push(c.coParentId);
+      }
+    }
+  }
+  const useTwinBoughs = hasMultipleUnions && unionGroups.length === 2;
+  if (useTwinBoughs) {
+    const forkDX = Math.round(g.rx * 0.135);
+    const forkDY = Math.round(g.ry * 0.135);
+    const plaqueDX = Math.max(225, Math.round(g.rx * 0.12));
+    const plaqueY = crownY - Math.round(forkDY * 0.48);
+
+    for (const spId of unionGroups) {
+      const sObj = founderSpouseById.get(spId);
+      if (!sObj) continue;
+      const side: -1 | 1 = sObj.pos.x < cx ? -1 : 1;
+      const groupChildren = root.children.filter((c) => c.coParentId === spId);
+      const groupLeaves = groupChildren.reduce((sum, c) => sum + c.leaves, 0);
+      const w0 = Math.max(92, Math.min(124, 58 + 13 * Math.sqrt(groupLeaves)));
+      const w1 = Math.round(w0 * 0.68);
+      const p0: Pt = { x: cx + side * g.trunkTopW * 0.24, y: crownY + 34 };
+      const tip: Pt = { x: cx + side * forkDX, y: crownY - forkDY };
+      const p1: Pt = { x: p0.x + side * forkDX * 0.22, y: p0.y - forkDY * 0.56 };
+      const p2: Pt = { x: tip.x - side * forkDX * 0.22, y: tip.y + forkDY * 0.34 };
+      const tangent = bezierTangent(p0, p1, p2, tip, 1);
+
+      unionBoughs.set(spId, {
+        spouseId: spId,
+        spouse: sObj,
+        side,
+        p0,
+        p1,
+        p2,
+        tip,
+        plaqueCenter: { x: cx + side * plaqueDX, y: plaqueY },
+        w0,
+        w1,
+        tangent,
+      });
+
+      // Draw the grand wooden charpentière
+      wood.push(`<path d="${taperedPath(p0, p1, p2, tip, w0, w1, 24)}" fill="${WOOD_BY_DEPTH[0]}"/>`);
+      wood.push(`<circle cx="${f(tip.x)}" cy="${f(tip.y)}" r="${f(w1 * 0.48)}" fill="${WOOD_BY_DEPTH[0]}"/>`);
+      bark.push(
+        `<path d="${curvePath(p0, p1, p2, tip)}" fill="none" stroke="#E9D9BF" stroke-opacity="0.24" stroke-width="${f(
+          Math.max(3, w1 * 0.14)
+        )}" stroke-linecap="round"/>`
+      );
+    }
+  }
+
   // 2. Branches (thickest first so finer twigs overlay them)
   const branchNodes = all.filter((n) => n.parent).sort((a, b) => a.depth - b.depth);
   for (const n of branchNodes) {
@@ -549,15 +719,28 @@ export function buildBotanicalTreeSvg(
     const uChild = { x: Math.cos(rad(n.angle)), y: -Math.sin(rad(n.angle)) };
     let w0: number;
     if (parent.depth === 0) {
-      const idx = root.children.indexOf(n);
-      const count = root.children.length;
-      p0 = { x: cx + ((idx + 0.5) / count - 0.5) * g.trunkTopW * 0.9, y: crownY + 40 };
-      const len = Math.hypot(p3.x - p0.x, p3.y - p0.y);
-      const dir = { x: (p3.x - p0.x) / len, y: (p3.y - p0.y) / len };
-      const v = { x: dir.x * 0.45, y: dir.y * 0.45 - 0.55 };
-      const vl = Math.hypot(v.x, v.y);
-      p1 = { x: p0.x + (v.x / vl) * len * 0.42, y: p0.y + (v.y / vl) * len * 0.42 };
-      w0 = thickness(n) * 1.45;
+      const bough = useTwinBoughs && n.coParentId ? unionBoughs.get(n.coParentId) : undefined;
+      if (bough) {
+        p0 = bough.tip;
+        const len = Math.hypot(p3.x - p0.x, p3.y - p0.y) || 1;
+        const dir = { x: (p3.x - p0.x) / len, y: (p3.y - p0.y) / len };
+        // Blend smoothly out of the charpentière tangent toward the child medallion
+        const v = { x: dir.x * 0.62 + bough.tangent.x * 0.38, y: dir.y * 0.62 + bough.tangent.y * 0.38 };
+        const vl = Math.hypot(v.x, v.y) || 1;
+        p1 = { x: p0.x + (v.x / vl) * len * 0.42, y: p0.y + (v.y / vl) * len * 0.42 };
+        w0 = Math.min(bough.w1 * 0.94, thickness(n) * 1.28);
+      } else {
+        const idx = root.children.indexOf(n);
+        const count = root.children.length;
+        const anchorOffsetX = ((idx + 0.5) / count - 0.5) * g.trunkTopW * 0.9;
+        p0 = { x: cx + anchorOffsetX, y: crownY + 40 };
+        const len = Math.hypot(p3.x - p0.x, p3.y - p0.y) || 1;
+        const dir = { x: (p3.x - p0.x) / len, y: (p3.y - p0.y) / len };
+        const v = { x: dir.x * 0.45, y: dir.y * 0.45 - 0.55 };
+        const vl = Math.hypot(v.x, v.y) || 1;
+        p1 = { x: p0.x + (v.x / vl) * len * 0.42, y: p0.y + (v.y / vl) * len * 0.42 };
+        w0 = thickness(n) * 1.45;
+      }
     } else {
       p0 = parent.pos;
       const uParent = { x: Math.cos(rad(parent.angle)), y: -Math.sin(rad(parent.angle)) };
@@ -638,6 +821,22 @@ export function buildBotanicalTreeSvg(
     const p2 = { x: s.pos.x - side * 280, y: s.pos.y + 14 };
     const p3 = { x: s.pos.x - side * r * 0.5, y: s.pos.y };
     roots += `<path d="${taperedPath(p0, p1, p2, p3, 62, 18)}" fill="${WOOD_BY_DEPTH[0]}"/>`;
+    if (hasMultipleUnions) {
+      // Subtle golden sap-thread tracing from each founder spouse's root up into their own charpentière
+      const bough = unionBoughs.get(s.person.id);
+      const endPt = bough ? bough.tip : { x: cx + side * g.trunkTopW * 0.31, y: crownY + 26 };
+      const midTop = bough ? bough.p0 : { x: cx + side * g.trunkTopW * 0.34, y: crownY + 48 };
+      const boughSegment = bough
+        ? `C${f(bough.p1.x)} ${f(bough.p1.y)} ${f(bough.p2.x)} ${f(bough.p2.y)} ${f(endPt.x)} ${f(endPt.y)}`
+        : '';
+      bark.push(
+        `<path d="M${f(p3.x)} ${f(p3.y)}C${f(p2.x)} ${f(p2.y)} ${f(p1.x)} ${f(p1.y)} ${f(p0.x)} ${f(
+          p0.y
+        )}C${f(cx + side * g.trunkBaseW * 0.24)} ${f(groundY - h * 0.32)} ${f(
+          cx + side * g.trunkTopW * 0.32
+        )} ${f(crownY + h * 0.35)} ${f(midTop.x)} ${f(midTop.y)}${boughSegment}" fill="none" stroke="${GOLD_LIGHT}" stroke-opacity="0.52" stroke-width="4.5" stroke-linecap="round" stroke-dasharray="10 10"/>`
+      );
+    }
   }
   for (let k = 0; k < 6; k++) {
     const side = k % 2 === 0 ? -1 : 1;
@@ -686,6 +885,39 @@ export function buildBotanicalTreeSvg(
     locked?: boolean;
   }
   const placedLabels: PlacedLabel[] = [];
+  const unionCartouches: { center: Pt; lines: TextLine[]; w: number; h: number }[] = [];
+
+  // Pre-reserve collision boxes for the two grand union cartouches right on the charpentières
+  if (useTwinBoughs) {
+    for (const bough of unionBoughs.values()) {
+      const uLines: TextLine[] = [
+        { text: 'UNION', size: 20, family: 'sans', fill: GOLD, weight: 700, spacing: 5 },
+        {
+          text: `${shortFirst(root.person)} & ${shortFirst(bough.spouse.person)}`,
+          size: 38,
+          family: 'serif',
+          fill: INK,
+          weight: 700,
+          italic: true,
+        },
+      ];
+      const { w: rawW, h: rawH } = blockSize(uLines);
+      const cw = rawW + 58;
+      const ch = rawH + 28;
+      unionCartouches.push({ center: bough.plaqueCenter, lines: uLines, w: cw, h: ch });
+      placedLabels.push({
+        ownerId: `union-${bough.spouseId}`,
+        anchor: bough.plaqueCenter,
+        anchorR: 0,
+        lines: [],
+        w: cw,
+        h: ch,
+        cx: bough.plaqueCenter.x,
+        cy: bough.plaqueCenter.y,
+        locked: true,
+      });
+    }
+  }
 
   const rectCircleOverlap = (rx: number, ry: number, rw: number, rh: number, cx0: number, cy0: number, cr: number) => {
     const nx = Math.max(rx - rw / 2, Math.min(cx0, rx + rw / 2));
@@ -853,7 +1085,28 @@ export function buildBotanicalTreeSvg(
   }
 
   for (const pl of placedLabels) {
+    if (pl.lines.length === 0) continue;
     labels.push(renderBlock(pl.lines, { x: pl.cx, y: pl.cy }, true));
+  }
+
+  // Render the refined framed union cartouches right over the left & right charpentières
+  for (const uc of unionCartouches) {
+    const x0 = uc.center.x - uc.w / 2;
+    const y0 = uc.center.y - uc.h / 2;
+    labels.push(
+      `<g>` +
+        `<rect x="${f(x0 + 3)}" y="${f(y0 + 5)}" width="${f(uc.w)}" height="${f(uc.h)}" rx="${f(
+          uc.h / 2
+        )}" fill="#2A1E12" fill-opacity="0.14"/>` +
+        `<rect x="${f(x0)}" y="${f(y0)}" width="${f(uc.w)}" height="${f(uc.h)}" rx="${f(
+          uc.h / 2
+        )}" fill="${PAPER}" fill-opacity="0.96" stroke="${GOLD}" stroke-width="3.2"/>` +
+        `<rect x="${f(x0 + 6)}" y="${f(y0 + 6)}" width="${f(uc.w - 12)}" height="${f(uc.h - 12)}" rx="${f(
+          (uc.h - 12) / 2
+        )}" fill="none" stroke="${GOLD_LIGHT}" stroke-width="1.4"/>` +
+        renderBlock(uc.lines, uc.center, false) +
+        `</g>`
+    );
   }
 
   // 5. Title cartouche, legends, frame
@@ -878,20 +1131,36 @@ export function buildBotanicalTreeSvg(
       subtitle
     )}</text>`;
 
-  // Branch legend (top-left)
+  // Branch legend (top-left), grouped by union when the founder had multiple unions
   const legendX = 230;
   let legendY = 270;
   let legend = `<text x="${legendX}" y="${legendY}" font-family="${SANS}" font-size="28" font-weight="700" letter-spacing="10" fill="${GOLD}">LES BRANCHES</text>`;
-  legendY += 30;
+  legendY += 26;
+  let lastUnionKey: string | undefined;
   root.children.forEach((c, i) => {
     const st = LINEAGES[i % LINEAGES.length];
-    legendY += 66;
+    if (hasMultipleUnions) {
+      const unionKey = c.coParentId || '__other__';
+      if (unionKey !== lastUnionKey) {
+        lastUnionKey = unionKey;
+        const coSpouse = c.coParentId ? founderSpouseById.get(c.coParentId)?.person : undefined;
+        const unionTitle = coSpouse
+          ? `${shortFirst(root.person)} & ${shortFirst(coSpouse)}`
+          : `Lignée ${shortFirst(root.person)}`;
+        legendY += i === 0 ? 44 : 58;
+        legend += `<text x="${legendX}" y="${legendY}" font-family="${SERIF}" font-size="30" font-style="italic" font-weight="600" fill="${GOLD}">${xml(
+          unionTitle
+        )}</text>`;
+        legendY += 8;
+      }
+    }
+    legendY += 62;
     const members = 1 + countSubtree(c);
     legend +=
-      `<circle cx="${legendX + 22}" cy="${legendY - 14}" r="20" fill="${st.light}" stroke="${st.ring}" stroke-width="5"/>` +
-      `<text x="${legendX + 62}" y="${legendY}" font-family="${SERIF}" font-size="44" font-weight="700" fill="${INK}">${xml(
+      `<circle cx="${legendX + 22}" cy="${legendY - 14}" r="19" fill="${st.light}" stroke="${st.ring}" stroke-width="5"/>` +
+      `<text x="${legendX + 60}" y="${legendY}" font-family="${SERIF}" font-size="42" font-weight="700" fill="${INK}">${xml(
         shortFirst(c.person)
-      )}<tspan dx="16" font-size="34" font-weight="400" font-style="italic" fill="${INK_SOFT}">· ${members} membre${
+      )}<tspan dx="16" font-size="32" font-weight="400" font-style="italic" fill="${INK_SOFT}">· ${members} membre${
         members > 1 ? 's' : ''
       }</tspan></text>`;
   });
@@ -904,11 +1173,12 @@ export function buildBotanicalTreeSvg(
   for (let d = 0; d <= maxDepth; d++) {
     const meta = GENERATION_LABELS[d] || { roman: `${d + 1}`, title: `Génération ${d + 1}`, era: '' };
     const count = all.filter((n) => n.depth === d).length + (d === 0 ? founderSpouses.length : 0);
+    const genTitle = d === 1 && count !== 5 ? 'Les Branches' : meta.title;
     genY += 62;
     genLegend +=
       `<text x="${genX}" y="${genY}" text-anchor="end" font-family="${SERIF}" font-size="40" fill="${INK}"><tspan font-style="italic" font-weight="700" fill="${GOLD}">${xml(
         meta.roman
-      )}</tspan>  ${xml(meta.title)} <tspan font-size="32" font-style="italic" fill="${INK_SOFT}">· ${count}</tspan></text>`;
+      )}</tspan>  ${xml(genTitle)} <tspan font-size="32" font-style="italic" fill="${INK_SOFT}">· ${count}</tspan></text>`;
   }
 
   const othersSvg = others.length
