@@ -42,7 +42,11 @@ interface PhotoCropperModalProps {
 type ShapeType = 'circle' | 'oval' | 'portrait' | 'square';
 type FilterType = 'none' | 'sepia' | 'bw' | 'warm';
 
-const OUTPUT_DIM = 380;
+const PREVIEW_DIM = 420;
+const MAX_EXPORT_DIM = 1200;
+const MIN_EXPORT_DIM = 640;
+// Firestore hard document limit is 1,048,576 bytes; keep ~98 KB headroom for metadata
+const MAX_FIRESTORE_PHOTO_CHARS = 950_000;
 
 export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   isOpen,
@@ -102,22 +106,24 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   }, [isOpen, initialImageSrc, initialFilter, initialShape, person]);
 
+  const [exportResolution, setExportResolution] = useState<number>(MAX_EXPORT_DIM);
+
   // Compute Cover Scale: scale factor so at zoom=1.0, the photo completely fills the frame
-  const getCoverScale = useCallback((img: HTMLImageElement, rot: number) => {
+  const getCoverScale = useCallback((img: HTMLImageElement, rot: number, dim: number = PREVIEW_DIM) => {
     const isSideways = rot % 180 !== 0;
     const effW = isSideways ? img.height : img.width;
     const effH = isSideways ? img.width : img.height;
     const minSide = Math.max(1, Math.min(effW, effH));
-    return OUTPUT_DIM / minSide;
+    return dim / minSide;
   }, []);
 
   // Compute Contain Scale: scale factor so the entire photo fits without cropping
-  const getContainScale = useCallback((img: HTMLImageElement, rot: number) => {
+  const getContainScale = useCallback((img: HTMLImageElement, rot: number, dim: number = PREVIEW_DIM) => {
     const isSideways = rot % 180 !== 0;
     const effW = isSideways ? img.height : img.width;
     const effH = isSideways ? img.width : img.height;
     const maxSide = Math.max(1, Math.max(effW, effH));
-    return OUTPUT_DIM / maxSide;
+    return dim / maxSide;
   }, []);
 
   // Load Image element safely without setting crossOrigin on data URLs
@@ -184,84 +190,133 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   };
 
-  // Generate canvas rendering with exact scaling, rotation and framing
+  // Shared renderer for both fast live preview and HD export
+  const drawPortraitOnCanvas = useCallback(
+    (targetCanvas: HTMLCanvasElement, dim: number) => {
+      if (!loadedImage) return false;
+
+      targetCanvas.width = dim;
+      targetCanvas.height = dim;
+      const ctx = targetCanvas.getContext('2d');
+      if (!ctx) return false;
+
+      ctx.clearRect(0, 0, dim, dim);
+
+      // 1. Warm archival paper base (prevents black background in JPEG)
+      ctx.fillStyle = '#FAF8F5';
+      ctx.fillRect(0, 0, dim, dim);
+
+      // 2. Exact scale calculation: cover scale * user zoom, with normalized pan
+      const center = dim / 2;
+      const scaleRatio = dim / PREVIEW_DIM;
+      const baseScale = getCoverScale(loadedImage, rotation, dim);
+      const effectiveScale = baseScale * zoom;
+
+      ctx.save();
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
+      ctx.translate(center + pan.x * scaleRatio, center + pan.y * scaleRatio);
+      ctx.rotate((rotation * Math.PI) / 180);
+      ctx.scale(effectiveScale, effectiveScale);
+
+      // Draw the image centered around the origin
+      ctx.drawImage(loadedImage, -loadedImage.width / 2, -loadedImage.height / 2);
+      ctx.restore();
+
+      // 3. Apply color filters if selected
+      if (filter !== 'none') {
+        try {
+          const imgData = ctx.getImageData(0, 0, dim, dim);
+          const d = imgData.data;
+
+          for (let i = 0; i < d.length; i += 4) {
+            const r = d[i];
+            const g = d[i + 1];
+            const b = d[i + 2];
+            const a = d[i + 3];
+            if (a === 0) continue;
+
+            if (filter === 'sepia') {
+              const tr = 0.393 * r + 0.769 * g + 0.189 * b;
+              const tg = 0.349 * r + 0.686 * g + 0.168 * b;
+              const tb = 0.272 * r + 0.534 * g + 0.131 * b;
+              d[i] = Math.min(255, tr * 1.05);
+              d[i + 1] = Math.min(255, tg * 0.98);
+              d[i + 2] = Math.min(255, tb * 0.88);
+            } else if (filter === 'bw') {
+              const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+              const contrast = (gray - 128) * 1.15 + 128;
+              const clamped = Math.max(0, Math.min(255, contrast));
+              d[i] = clamped;
+              d[i + 1] = clamped;
+              d[i + 2] = clamped;
+            } else if (filter === 'warm') {
+              d[i] = Math.min(255, r * 1.08 + 8);
+              d[i + 1] = Math.min(255, g * 1.02 + 4);
+              d[i + 2] = Math.max(0, b * 0.92 - 4);
+            }
+          }
+          ctx.putImageData(imgData, 0, 0);
+        } catch (err) {
+          console.warn('Canvas filter error:', err);
+        }
+      }
+
+      return true;
+    },
+    [loadedImage, filter, zoom, pan, rotation, getCoverScale]
+  );
+
+  // Fast live interactive preview rendering (420x420)
   const renderCropCanvas = useCallback(() => {
     if (!loadedImage || !canvasRef.current) return '';
-
-    const canvas = canvasRef.current;
-    canvas.width = OUTPUT_DIM;
-    canvas.height = OUTPUT_DIM;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return '';
-
-    ctx.clearRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
-
-    // 1. Warm archival paper base (prevents black background in JPEG)
-    ctx.fillStyle = '#FAF8F5';
-    ctx.fillRect(0, 0, OUTPUT_DIM, OUTPUT_DIM);
-
-    // 2. Exact scale calculation: cover scale * user zoom
-    const center = OUTPUT_DIM / 2;
-    const baseScale = getCoverScale(loadedImage, rotation);
-    const effectiveScale = baseScale * zoom;
-
-    ctx.save();
-    ctx.translate(center + pan.x, center + pan.y);
-    ctx.rotate((rotation * Math.PI) / 180);
-    ctx.scale(effectiveScale, effectiveScale);
-
-    // Draw the image centered around the origin
-    ctx.drawImage(loadedImage, -loadedImage.width / 2, -loadedImage.height / 2);
-    ctx.restore();
-
-    // 3. Apply color filters if selected
-    if (filter !== 'none') {
-      try {
-        const imgData = ctx.getImageData(0, 0, OUTPUT_DIM, OUTPUT_DIM);
-        const d = imgData.data;
-
-        for (let i = 0; i < d.length; i += 4) {
-          const r = d[i];
-          const g = d[i + 1];
-          const b = d[i + 2];
-          const a = d[i + 3];
-          if (a === 0) continue;
-
-          if (filter === 'sepia') {
-            const tr = 0.393 * r + 0.769 * g + 0.189 * b;
-            const tg = 0.349 * r + 0.686 * g + 0.168 * b;
-            const tb = 0.272 * r + 0.534 * g + 0.131 * b;
-            d[i] = Math.min(255, tr * 1.05);
-            d[i + 1] = Math.min(255, tg * 0.98);
-            d[i + 2] = Math.min(255, tb * 0.88);
-          } else if (filter === 'bw') {
-            const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-            const contrast = (gray - 128) * 1.15 + 128;
-            const clamped = Math.max(0, Math.min(255, contrast));
-            d[i] = clamped;
-            d[i + 1] = clamped;
-            d[i + 2] = clamped;
-          } else if (filter === 'warm') {
-            d[i] = Math.min(255, r * 1.08 + 8);
-            d[i + 1] = Math.min(255, g * 1.02 + 4);
-            d[i + 2] = Math.max(0, b * 0.92 - 4);
-          }
-        }
-        ctx.putImageData(imgData, 0, 0);
-      } catch (err) {
-        console.warn('Canvas filter error:', err);
-      }
-    }
+    if (!drawPortraitOnCanvas(canvasRef.current, PREVIEW_DIM)) return '';
 
     try {
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.88);
+      const dataUrl = canvasRef.current.toDataURL('image/jpeg', 0.85);
       setPreviewDataUrl(dataUrl);
-      setEstimatedSizeKb(Math.round(dataUrl.length / 1024));
       return dataUrl;
     } catch {
       return '';
     }
-  }, [loadedImage, filter, zoom, pan, rotation, getCoverScale]);
+  }, [loadedImage, drawPortraitOnCanvas]);
+
+  // High-definition adaptive export (up to 1200x1200, JPEG 0.94, capped safely under Firestore 1MB limit)
+  const renderHighDefPortrait = useCallback((): { dataUrl: string; dim: number } => {
+    if (!loadedImage) return { dataUrl: '', dim: PREVIEW_DIM };
+
+    const isSideways = rotation % 180 !== 0;
+    const effW = isSideways ? loadedImage.height : loadedImage.width;
+    const effH = isSideways ? loadedImage.width : loadedImage.height;
+    const sourceMinSide = Math.max(1, Math.min(effW, effH));
+    const idealDim = Math.min(
+      MAX_EXPORT_DIM,
+      Math.max(MIN_EXPORT_DIM, Math.round(sourceMinSide / Math.max(0.5, zoom)))
+    );
+
+    const exportCanvas = document.createElement('canvas');
+    const candidateDims = Array.from(
+      new Set([idealDim, Math.min(idealDim, 960), Math.min(idealDim, 768), PREVIEW_DIM])
+    ).sort((a, b) => b - a);
+    const candidateQualities = [0.94, 0.91, 0.88, 0.84, 0.78];
+
+    let bestUrl = '';
+    let bestDim = idealDim;
+
+    for (const dim of candidateDims) {
+      if (!drawPortraitOnCanvas(exportCanvas, dim)) continue;
+      for (const q of candidateQualities) {
+        const url = exportCanvas.toDataURL('image/jpeg', q);
+        bestUrl = url;
+        bestDim = dim;
+        if (url.length <= MAX_FIRESTORE_PHOTO_CHARS) {
+          return { dataUrl: url, dim };
+        }
+      }
+    }
+
+    return { dataUrl: bestUrl, dim: bestDim };
+  }, [loadedImage, rotation, zoom, drawPortraitOnCanvas]);
 
   useEffect(() => {
     if (loadedImage) {
@@ -269,7 +324,24 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     }
   }, [loadedImage, shape, filter, zoom, pan, rotation, renderCropCanvas]);
 
-  // Drag interaction for positioning the image
+  // Debounced accurate HD size estimation when user pauses adjusting
+  useEffect(() => {
+    if (!loadedImage) return;
+    const timer = window.setTimeout(() => {
+      try {
+        const { dataUrl, dim } = renderHighDefPortrait();
+        if (dataUrl) {
+          setEstimatedSizeKb(Math.round(dataUrl.length / 1024));
+          setExportResolution(dim);
+        }
+      } catch {
+        // ignore estimation error
+      }
+    }, 260);
+    return () => window.clearTimeout(timer);
+  }, [loadedImage, filter, zoom, pan, rotation, renderHighDefPortrait]);
+
+  // Drag interaction for positioning the image (1:1 screen pixel tracking)
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!loadedImage || e.pointerType === 'touch') return;
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -284,8 +356,10 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!isDragging || !dragStart || e.pointerType === 'touch') return;
-    const dx = e.clientX - dragStart.x;
-    const dy = e.clientY - dragStart.y;
+    const rectWidth = (e.currentTarget as HTMLElement).getBoundingClientRect().width || PREVIEW_DIM;
+    const ratio = PREVIEW_DIM / rectWidth;
+    const dx = (e.clientX - dragStart.x) * ratio;
+    const dy = (e.clientY - dragStart.y) * ratio;
     setPan({
       x: Math.round(dragStart.panX + dx),
       y: Math.round(dragStart.panY + dy),
@@ -339,9 +413,11 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
       setZoom(next);
     } else if (e.touches.length === 1 && isDragging && dragStart) {
       const t = e.touches[0];
+      const rectWidth = (e.currentTarget as HTMLElement).getBoundingClientRect().width || PREVIEW_DIM;
+      const ratio = PREVIEW_DIM / rectWidth;
       setPan({
-        x: Math.round(dragStart.panX + (t.clientX - dragStart.x)),
-        y: Math.round(dragStart.panY + (t.clientY - dragStart.y)),
+        x: Math.round(dragStart.panX + (t.clientX - dragStart.x) * ratio),
+        y: Math.round(dragStart.panY + (t.clientY - dragStart.y) * ratio),
       });
     }
   };
@@ -386,14 +462,14 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
     setPan({ x: 0, y: 0 });
   };
 
-  // Save handler with Cloud Firestore storage
+  // Save handler with Cloud Firestore HD storage
   const handleSaveAndSync = async () => {
     if (!loadedImage) return;
     setIsSaving(true);
     setErrorMessage(null);
 
     try {
-      const finalDataUrl = renderCropCanvas();
+      const { dataUrl: finalDataUrl } = renderHighDefPortrait();
       if (!finalDataUrl) throw new Error('Échec de la génération du portrait.');
 
       const result: CropResult = {
@@ -693,7 +769,7 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
                   <div className="mt-3.5 pt-2.5 border-t border-[#EAE3D6] flex items-center justify-between text-[11px] text-[#7A7266]">
                     <span className="flex items-center gap-1.5 text-[#4D7A58] font-medium">
                       <CloudCheck className="h-3.5 w-3.5" />
-                      Partagé avec toute la famille
+                      HD {exportResolution}×{exportResolution} · Cloud
                     </span>
                     <span className="font-mono tabular-nums">~{estimatedSizeKb} Ko</span>
                   </div>

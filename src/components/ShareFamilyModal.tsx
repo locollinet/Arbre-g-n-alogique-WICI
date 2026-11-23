@@ -22,7 +22,7 @@ export const ShareFamilyModal: React.FC<ShareFamilyModalProps> = ({
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      setShareUrl(window.location.href);
+      setShareUrl(`${window.location.origin}${window.location.pathname}${window.location.search}`);
       setCanNativeShare(typeof navigator !== 'undefined' && !!navigator.share);
     }
   }, [isOpen]);

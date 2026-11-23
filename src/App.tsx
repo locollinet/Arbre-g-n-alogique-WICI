@@ -109,11 +109,17 @@ export default function App() {
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
   const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'indisponible'>('chargement');
   const hasSeededArchiveRef = useRef(false);
+  const hasReconciledInitialSeedRef = useRef(false);
 
   const peopleRef = useRef<Person[]>(people);
   useEffect(() => {
     peopleRef.current = people;
   }, [people]);
+
+  const settingsRef = useRef<TreeSettings>(settings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
@@ -122,16 +128,18 @@ export default function App() {
     setToastMsg(msg);
   }, []);
 
-  // Helper to persist tree changes to Firestore in the background
+  // Helper to persist tree changes to Firestore and report real status
   const syncTreeToCloud = useCallback(
-    (nextPeople: Person[], nextSettings: TreeSettings) => {
-      saveFamilyArchiveToFirestore(nextPeople, nextSettings)
-        .then(() => {
-          setCloudStatus('disponible');
-        })
-        .catch((err) => {
-          console.warn('Synchronisation Firestore différée:', err);
-        });
+    async (nextPeople: Person[], nextSettings: TreeSettings): Promise<boolean> => {
+      try {
+        await saveFamilyArchiveToFirestore(nextPeople, nextSettings);
+        setCloudStatus('disponible');
+        return true;
+      } catch (err) {
+        console.error('Erreur synchronisation Firestore:', err);
+        setCloudStatus('indisponible');
+        return false;
+      }
     },
     []
   );
@@ -178,10 +186,49 @@ export default function App() {
 
   // 2. Subscribe to real-time Family Archive (people + settings) in Firestore
   useEffect(() => {
+    const initialIds = new Set(INITIAL_WICI_PEOPLE.map((p) => p.id));
+
     const unsub = subscribeToFamilyArchive(
       (archiveRecord, fromCache) => {
         setCloudStatus(fromCache ? 'cache' : 'disponible');
         if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
+          // If the cloud doc only has the untouched default seed while this browser
+          // still holds locally added members (added before cloud was connected),
+          // preserve and push those local members up to Firestore once.
+          if (!fromCache && !hasReconciledInitialSeedRef.current) {
+            hasReconciledInitialSeedRef.current = true;
+            const cloudIds = new Set(archiveRecord.people.map((p) => p.id));
+            const cloudIsOnlyDefaultSeed =
+              archiveRecord.people.length === INITIAL_WICI_PEOPLE.length &&
+              archiveRecord.people.every((p) => initialIds.has(p.id));
+            const localExtraMembers = peopleRef.current.filter(
+              (p) => !initialIds.has(p.id) && !cloudIds.has(p.id)
+            );
+
+            if (cloudIsOnlyDefaultSeed && localExtraMembers.length > 0) {
+              const mergedPeople = [...archiveRecord.people, ...localExtraMembers].map((cp) => ({
+                ...cp,
+                photo:
+                  lastCloudPhotos.current[cp.id]?.photoDataUrl ||
+                  peopleRef.current.find((lp) => lp.id === cp.id)?.photo ||
+                  cp.photo,
+              }));
+              peopleRef.current = mergedPeople;
+              setPeople(mergedPeople);
+              void saveFamilyArchiveToFirestore(mergedPeople, settingsRef.current)
+                .then(() => {
+                  setCloudStatus('disponible');
+                  notify(
+                    `${localExtraMembers.length} membre(s) local(aux) synchronisé(s) vers le cloud.`
+                  );
+                })
+                .catch((err) => {
+                  console.error('Erreur fusion initiale Firestore:', err);
+                });
+              return;
+            }
+          }
+
           setPeople((prev) => {
             // Merge cloud people with currently loaded photos without losing local portraits
             const prevPhotos = new Map(prev.map((p) => [p.id, p.photo]));
@@ -200,17 +247,22 @@ export default function App() {
         // Document doesn't exist yet on Firestore: seed the database with our initial copy!
         if (!hasSeededArchiveRef.current) {
           hasSeededArchiveRef.current = true;
-          saveFamilyArchiveToFirestore(peopleRef.current, settings)
+          hasReconciledInitialSeedRef.current = true;
+          saveFamilyArchiveToFirestore(peopleRef.current, settingsRef.current)
             .then(() => setCloudStatus('disponible'))
-            .catch(() => {});
+            .catch((err) => {
+              console.error('Erreur initialisation archive Firestore:', err);
+              setCloudStatus('indisponible');
+            });
         }
       },
-      () => {
+      (err) => {
+        console.error('Erreur synchronisation archive Firestore:', err);
         setCloudStatus('indisponible');
       }
     );
     return () => unsub();
-  }, []);
+  }, [notify]);
 
   // 3. Subscribe to real-time Cloud Photos in Firestore
   useEffect(() => {
@@ -350,17 +402,22 @@ export default function App() {
       : '#FAF8F5';
 
   const handleUpdateSettings = (partial: Partial<TreeSettings>) => {
-    setSettings((prev) => {
-      const next = { ...prev, ...partial };
-      syncTreeToCloud(people, next);
-      return next;
-    });
+    const next = { ...settingsRef.current, ...partial };
+    settingsRef.current = next;
+    setSettings(next);
+    void syncTreeToCloud(peopleRef.current, next);
   };
 
   const handleResetSettings = () => {
+    settingsRef.current = DEFAULT_SETTINGS;
     setSettings(DEFAULT_SETTINGS);
-    syncTreeToCloud(people, DEFAULT_SETTINGS);
-    notify('Réglages esthétiques restaurés aux valeurs par défaut.');
+    void syncTreeToCloud(peopleRef.current, DEFAULT_SETTINGS).then((ok) => {
+      notify(
+        ok
+          ? 'Réglages esthétiques restaurés et synchronisés.'
+          : 'Réglages restaurés localement (synchronisation cloud en attente).'
+      );
+    });
   };
 
   const handleOpenPerson = (id: string) => {
@@ -376,71 +433,88 @@ export default function App() {
   };
 
   const handleSavePerson = (updated: Person, childIdsToAttach?: string[]) => {
-    const isNewPerson = !people.some((p) => p.id === updated.id);
-    setPeople((prev) => {
-      const exists = prev.some((p) => p.id === updated.id);
-      let nextList = exists
-        ? prev.map((p) => (p.id === updated.id ? updated : p))
-        : [...prev, updated];
+    const prevList = peopleRef.current;
+    const isNewPerson = !prevList.some((p) => p.id === updated.id);
+    let nextList = isNewPerson
+      ? [...prevList, updated]
+      : prevList.map((p) => (p.id === updated.id ? updated : p));
 
-      if (childIdsToAttach) {
-        const childSet = new Set(childIdsToAttach);
-        nextList = nextList.map((p) => {
-          if (p.id === updated.id) return p;
-          const currentlyHasParent = (p.parents || []).includes(updated.id);
-          if (childSet.has(p.id) && !currentlyHasParent) {
-            return { ...p, parents: [...(p.parents || []), updated.id] };
-          }
-          if (!childSet.has(p.id) && currentlyHasParent) {
-            return { ...p, parents: (p.parents || []).filter((id) => id !== updated.id) };
-          }
-          return p;
-        });
-      }
+    if (childIdsToAttach) {
+      const childSet = new Set(childIdsToAttach);
+      nextList = nextList.map((p) => {
+        if (p.id === updated.id) return p;
+        const currentlyHasParent = (p.parents || []).includes(updated.id);
+        if (childSet.has(p.id) && !currentlyHasParent) {
+          return { ...p, parents: [...(p.parents || []), updated.id] };
+        }
+        if (!childSet.has(p.id) && currentlyHasParent) {
+          return { ...p, parents: (p.parents || []).filter((id) => id !== updated.id) };
+        }
+        return p;
+      });
+    }
 
-      syncTreeToCloud(nextList, settings);
-      return nextList;
-    });
-
+    peopleRef.current = nextList;
+    setPeople(nextList);
     setSelectedPersonId(updated.id);
-    notify(`Fiche de ${getFullName(updated)} enregistrée et synchronisée.`);
+
+    void syncTreeToCloud(nextList, settingsRef.current).then((ok) => {
+      notify(
+        ok
+          ? `Fiche de ${getFullName(updated)} enregistrée et synchronisée pour toute la famille.`
+          : `Fiche de ${getFullName(updated)} enregistrée localement (synchronisation cloud indisponible).`
+      );
+    });
 
     if (isNewPerson && updated.photo) {
       void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo })
         .then((record) => {
           setPhotosMap((prev) => ({ ...prev, [updated.id]: record }));
         })
-        .catch(() => {});
+        .catch((err) => {
+          console.error('Erreur enregistrement photo Firestore:', err);
+        });
     }
   };
 
   const handleDeletePerson = (id: string) => {
-    const target = people.find((p) => p.id === id);
-    setPeople((prev) => {
-      const nextList = prev
-        .filter((p) => p.id !== id)
-        .map((p) => ({
-          ...p,
-          parents: (p.parents || []).filter((pid) => pid !== id),
-          spouses: (p.spouses || []).filter((sid) => sid !== id),
-        }));
-      syncTreeToCloud(nextList, settings);
-      return nextList;
-    });
+    const prevList = peopleRef.current;
+    const target = prevList.find((p) => p.id === id);
+    const nextList = prevList
+      .filter((p) => p.id !== id)
+      .map((p) => ({
+        ...p,
+        parents: (p.parents || []).filter((pid) => pid !== id),
+        spouses: (p.spouses || []).filter((sid) => sid !== id),
+      }));
+
+    peopleRef.current = nextList;
+    setPeople(nextList);
     if (focusBranch === id) setFocusBranch('all');
-    if (target) {
-      notify(`${getFullName(target)} a été retiré(e) de l’arbre.`);
-    }
+
+    void syncTreeToCloud(nextList, settingsRef.current).then((ok) => {
+      if (target) {
+        notify(
+          ok
+            ? `${getFullName(target)} a été retiré(e) de l’arbre pour toute la famille.`
+            : `${getFullName(target)} retiré(e) localement (synchronisation cloud indisponible).`
+        );
+      }
+    });
   };
 
   const handleImportData = (importedPeople: Person[], importedSettings?: Partial<TreeSettings>) => {
-    const nextSettings = importedSettings ? { ...settings, ...importedSettings } : settings;
+    const nextSettings = importedSettings
+      ? { ...settingsRef.current, ...importedSettings }
+      : settingsRef.current;
+    peopleRef.current = importedPeople;
     setPeople(importedPeople);
     if (importedSettings) {
+      settingsRef.current = nextSettings;
       setSettings(nextSettings);
     }
     setFocusBranch('all');
-    syncTreeToCloud(importedPeople, nextSettings);
+    void syncTreeToCloud(importedPeople, nextSettings);
 
     // Enregistrement immédiat de toutes les photos dans IndexedDB
     for (const p of importedPeople) {
@@ -459,11 +533,18 @@ export default function App() {
       ...p,
       photo: photosMap[p.id]?.photoDataUrl || p.photo,
     }));
+    peopleRef.current = withPhotos;
+    settingsRef.current = DEFAULT_SETTINGS;
     setPeople(withPhotos);
     setSettings(DEFAULT_SETTINGS);
     setFocusBranch('all');
-    syncTreeToCloud(withPhotos, DEFAULT_SETTINGS);
-    notify('Arbre initial de la famille Wici restauré et synchronisé.');
+    void syncTreeToCloud(withPhotos, DEFAULT_SETTINGS).then((ok) => {
+      notify(
+        ok
+          ? 'Arbre initial de la famille Wici restauré et synchronisé.'
+          : 'Arbre initial restauré localement (synchronisation cloud indisponible).'
+      );
+    });
   };
 
   const handleSavePersonPhoto = async (personId: string, result: CropResult) => {

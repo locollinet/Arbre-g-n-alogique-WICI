@@ -16,7 +16,7 @@
           "type": "string",
           "description": "Image recadrée et compressée au format Data URL (JPEG/WebP)",
           "minLength": 10,
-          "maxLength": 500000
+          "maxLength": 1000000
         },
         "shape": {
           "type": "string",
