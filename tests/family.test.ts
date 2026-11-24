@@ -256,4 +256,271 @@ test('avec Elsa sans descendance, Hubert et Nicolas comblent le haut sans franch
   }
 });
 
+test('moteur de synchro : éditions concurrentes multi-appareils préservées sans écrasement', async () => {
+  const {
+    buildUpsertPersonOp,
+    reconcileArchiveWithOutbox,
+    enqueueOperation,
+    removeCommittedOperations,
+    stripPeopleForStorage,
+  } = await import('../src/utils/syncEngine');
+
+  const basePeople = stripPeopleForStorage(INITIAL_WICI_PEOPLE);
+  const serverState = { people: basePeople, settings: DEFAULT_SETTINGS };
+
+  // Appareil A (Laurence) corrige les dates de Nicolas, Justine et Pierre (Peter)
+  const nicolasA = { ...basePeople.find((p) => p.id === 'nicolas')!, birth: '1977' };
+  const justineA = { ...basePeople.find((p) => p.id === 'justine')!, birth: '1983' };
+  const peterA = { ...basePeople.find((p) => p.id === 'peter')!, death: '2012' };
+
+  const opA1 = buildUpsertPersonOp(basePeople, nicolasA);
+  const opA2 = buildUpsertPersonOp(basePeople, justineA);
+  const opA3 = buildUpsertPersonOp(basePeople, peterA);
+
+  // Pendant ce temps, Appareil B (Louis) complète le nom d'Anatole et ajoute un enfant à Nicolas
+  const anatoleB = {
+    ...basePeople.find((p) => p.id === 'unknown2016')!,
+    first: 'Anatole',
+    last: 'Golay',
+  };
+  const louiseB: Person = {
+    id: 'louise-test',
+    first: 'Louise',
+    last: 'Wicikowski',
+    birth: '2018',
+    parents: ['nicolas'],
+  };
+  const opB1 = buildUpsertPersonOp(basePeople, anatoleB);
+  const opB2 = buildUpsertPersonOp(basePeople, louiseB);
+
+  // B commit en premier sur le serveur
+  const afterB = reconcileArchiveWithOutbox(serverState, [opB1, opB2]);
+  assert.equal(afterB.people.find((p) => p.id === 'unknown2016')?.first, 'Anatole');
+  assert.equal(afterB.people.find((p) => p.id === 'unknown2016')?.last, 'Golay');
+  assert.ok(afterB.people.some((p) => p.id === 'louise-test'));
+
+  // Ensuite A commit sa transaction sur le serveur contenant déjà les modifs de B
+  let outboxA = enqueueOperation([], opA1);
+  outboxA = enqueueOperation(outboxA, opA2);
+  outboxA = enqueueOperation(outboxA, opA3);
+
+  const afterAandB = reconcileArchiveWithOutbox(afterB, outboxA);
+
+  // TOUTES les modifications de A ET de B sont conservées !
+  assert.equal(afterAandB.people.find((p) => p.id === 'nicolas')?.birth, '1977');
+  assert.equal(afterAandB.people.find((p) => p.id === 'justine')?.birth, '1983');
+  assert.equal(afterAandB.people.find((p) => p.id === 'peter')?.death, '2012');
+  assert.equal(afterAandB.people.find((p) => p.id === 'unknown2016')?.first, 'Anatole');
+  assert.equal(afterAandB.people.find((p) => p.id === 'unknown2016')?.last, 'Golay');
+  assert.ok(afterAandB.people.some((p) => p.id === 'louise-test'));
+
+  // Une opération arrivée pendant le vol de la transaction reste dans l'outbox
+  const opInFlight = buildUpsertPersonOp(afterAandB.people, { ...nicolasA, location: 'Paris' });
+  const outboxDuringFlush = enqueueOperation(outboxA, opInFlight);
+  const remaining = removeCommittedOperations(
+    outboxDuringFlush,
+    new Set(outboxA.map((o) => o.opId))
+  );
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].opId, opInFlight.opId);
+});
+
+test('moteur de synchro : un snapshot retardé ou un réglage visuel ne peut jamais écraser les éditions en attente', async () => {
+  const {
+    buildUpsertPersonOp,
+    reconcileArchiveWithOutbox,
+    enqueueOperation,
+    stripPeopleForStorage,
+  } = await import('../src/utils/syncEngine');
+
+  const staleServer = {
+    people: stripPeopleForStorage(INITIAL_WICI_PEOPLE),
+    settings: DEFAULT_SETTINGS,
+  };
+
+  // L'utilisateur modifie un réglage visuel (ex: masquer les conjoints) puis modifie Anatole
+  let outbox = enqueueOperation([], {
+    opId: 's1',
+    createdAt: '2026-11-24T08:00:00.000Z',
+    type: 'UPDATE_SETTINGS',
+    partial: { showSpouses: false },
+  });
+  outbox = enqueueOperation(outbox, {
+    opId: 's2',
+    createdAt: '2026-11-24T08:00:01.000Z',
+    type: 'UPDATE_SETTINGS',
+    partial: { showMinimap: false },
+  });
+  // Les deux UPDATE_SETTINGS adjacents doivent être fusionnés en une seule écriture
+  assert.equal(outbox.length, 1);
+  assert.equal(outbox[0].type, 'UPDATE_SETTINGS');
+
+  const anatoleEdit = buildUpsertPersonOp(staleServer.people, {
+    ...staleServer.people.find((p) => p.id === 'unknown2016')!,
+    first: 'Anatole',
+    last: 'Golay',
+    photo: 'data:image/jpeg;base64,HEAVY_BASE64_THAT_MUST_BE_STRIPPED',
+  });
+  outbox = enqueueOperation(outbox, anatoleEdit);
+
+  // Le base64 ne doit JAMAIS entrer dans l'outbox ni dans localStorage
+  assert.equal(anatoleEdit.person.photo, undefined);
+
+  // Même si un snapshot serveur périmé arrive maintenant, la réconciliation préserve TOUT
+  const displayed = reconcileArchiveWithOutbox(staleServer, outbox);
+  assert.equal(displayed.settings.showSpouses, false);
+  assert.equal(displayed.settings.showMinimap, false);
+  assert.equal(displayed.people.find((p) => p.id === 'unknown2016')?.first, 'Anatole');
+  assert.equal(displayed.people.find((p) => p.id === 'unknown2016')?.last, 'Golay');
+  assert.equal(displayed.people.every((p) => p.photo === undefined), true);
+});
+
+test('delta photo watermark : bloque le mode delta tant que la synchro complète initiale n’a pas abouti et applique 5 min de recouvrement', async () => {
+  const { computeSafeDeltaWatermark } = await import('../src/utils/syncEngine');
+
+  // Nouvel appareil ayant uploadé 1 photo hors-ligne avant la 1re synchro complète -> DOIT faire une synchro complète (null)
+  assert.equal(computeSafeDeltaWatermark('2026-11-24T10:00:00.000Z', false, 1), null);
+  // Appareil dont IndexedDB a été vidé -> DOIT faire une synchro complète (null)
+  assert.equal(computeSafeDeltaWatermark('2026-11-24T10:00:00.000Z', true, 0), null);
+  // Timestamp corrompu ou absent -> null
+  assert.equal(computeSafeDeltaWatermark(null, true, 34), null);
+  assert.equal(computeSafeDeltaWatermark('not-a-date', true, 34), null);
+
+  // Appareil synchronisé avec cache IndexedDB peuplé -> watermark reculé de 5 minutes contre le décalage d'horloge
+  assert.equal(
+    computeSafeDeltaWatermark('2026-11-24T10:00:00.000Z', true, 34),
+    '2026-11-24T09:55:00.000Z'
+  );
+});
+
+test('moteur de synchro : deltas bidirectionnels conjoints/enfants et suppression sûre sans références orphelines', async () => {
+  const {
+    buildUpsertPersonOp,
+    applyOperationToArchive,
+    reconcileArchiveWithOutbox,
+    stripPeopleForStorage,
+  } = await import('../src/utils/syncEngine');
+
+  const basePeople = stripPeopleForStorage(INITIAL_WICI_PEOPLE);
+  const server = { people: basePeople, settings: DEFAULT_SETTINGS };
+
+  // Appareil A ajoute un conjoint à Louis (avec lien bidirectionnel)
+  const camille: Person = { id: 'camille-test', first: 'Camille', last: 'Dupont', parents: [], spouses: ['louis'] };
+  const opAddCamille = buildUpsertPersonOp(basePeople, camille);
+  const afterA = applyOperationToArchive(server, opAddCamille);
+  assert.deepEqual(afterA.people.find((p) => p.id === 'louis')?.spouses, ['camille-test']);
+  assert.deepEqual(afterA.people.find((p) => p.id === 'camille-test')?.spouses, ['louis']);
+
+  // Pendant ce temps Appareil B (qui n'avait pas encore vu Camille) modifie la ville de Louis
+  const louisB = { ...basePeople.find((p) => p.id === 'louis')!, location: 'Lyon' };
+  const opEditLouis = buildUpsertPersonOp(basePeople, louisB);
+
+  // La transaction B s'applique sur afterA : le lien conjoint Camille-Louis DOIT être conservé !
+  const afterAB = reconcileArchiveWithOutbox(afterA, [opEditLouis]);
+  assert.equal(afterAB.people.find((p) => p.id === 'louis')?.location, 'Lyon');
+  assert.deepEqual(afterAB.people.find((p) => p.id === 'louis')?.spouses, ['camille-test']);
+
+  // Suppression de Camille : nettoie proprement la référence conjoint chez Louis
+  const afterDelete = applyOperationToArchive(afterAB, {
+    opId: 'del-camille',
+    createdAt: '2026-11-24T10:05:00.000Z',
+    type: 'DELETE_PERSON',
+    personId: 'camille-test',
+  });
+  assert.equal(afterDelete.people.some((p) => p.id === 'camille-test'), false);
+  assert.equal(afterDelete.people.find((p) => p.id === 'louis')?.spouses, undefined);
+
+  // Garde-fou : impossible de vider totalement l'archive (règle Firestore people.size() >= 1)
+  const singlePersonArchive = { people: [basePeople[0]], settings: DEFAULT_SETTINGS };
+  const afterRefusedDelete = applyOperationToArchive(singlePersonArchive, {
+    opId: 'del-last',
+    createdAt: '2026-11-24T10:06:00.000Z',
+    type: 'DELETE_PERSON',
+    personId: basePeople[0].id,
+  });
+  assert.equal(afterRefusedDelete.people.length, 1);
+});
+
+test('scénario complet Laurence : 4 modifications + photo hors-ligne survivent au rechargement et s’exportent en A3', async () => {
+  const {
+    buildUpsertPersonOp,
+    enqueueOperation,
+    reconcileArchiveWithOutbox,
+    stripPeopleForStorage,
+    upsertPendingPhotoOp,
+  } = await import('../src/utils/syncEngine');
+  const { buildPhotoPosterSvg } = await import('../src/utils/photoPosterGenerator');
+
+  const serverBaseline = {
+    people: stripPeopleForStorage(INITIAL_WICI_PEOPLE),
+    settings: DEFAULT_SETTINGS,
+  };
+
+  // Laurence enchaîne ses 4 corrections (Nicolas, Justine, Pierre, Anatole) pendant une coupure / quota
+  let outbox = enqueueOperation(
+    [],
+    buildUpsertPersonOp(serverBaseline.people, {
+      ...serverBaseline.people.find((p) => p.id === 'nicolas')!,
+      birth: '1977',
+    })
+  );
+  let state = reconcileArchiveWithOutbox(serverBaseline, outbox);
+  outbox = enqueueOperation(
+    outbox,
+    buildUpsertPersonOp(state.people, {
+      ...state.people.find((p) => p.id === 'justine')!,
+      birth: '1983',
+    })
+  );
+  state = reconcileArchiveWithOutbox(serverBaseline, outbox);
+  outbox = enqueueOperation(
+    outbox,
+    buildUpsertPersonOp(state.people, {
+      ...state.people.find((p) => p.id === 'peter')!,
+      death: '2012',
+    })
+  );
+  state = reconcileArchiveWithOutbox(serverBaseline, outbox);
+  outbox = enqueueOperation(
+    outbox,
+    buildUpsertPersonOp(state.people, {
+      ...state.people.find((p) => p.id === 'unknown2016')!,
+      first: 'Anatole',
+      last: 'Golay',
+    })
+  );
+
+  // Elle met aussi à jour la photo de Sophie (mise en file persistante, jamais dans localStorage people)
+  const pendingPhotos = upsertPendingPhotoOp([], {
+    personId: 'sophie',
+    action: 'upsert',
+    updatedAt: '2026-11-24T08:30:00.000Z',
+  });
+  assert.equal(pendingPhotos.length, 1);
+
+  // Simulation d'un rechargement de page + arrivée d'un vieux snapshot serveur non mis à jour
+  const serializedOutbox = JSON.parse(JSON.stringify(outbox));
+  const afterReload = reconcileArchiveWithOutbox(serverBaseline, serializedOutbox);
+
+  // Vérifie que la taille JSON stockée en localStorage reste minuscule (< 25 Ko)
+  const localStorageSize = JSON.stringify(stripPeopleForStorage(afterReload.people)).length;
+  assert.ok(localStorageSize < 25000, `localStorage people trop lourd: ${localStorageSize} octets`);
+
+  // Réhydratation du portrait local de Sophie + export A3 immédiat
+  const peopleWithPortrait = afterReload.people.map((p) =>
+    p.id === 'sophie' ? { ...p, photo: 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD=' } : p
+  );
+  const poster = buildPhotoPosterSvg(peopleWithPortrait, afterReload.settings, {
+    orientation: 'landscape',
+    style: 'tree',
+  });
+  assert.ok(poster.svg.includes('1977'), 'Date de Nicolas manquante sur l’affiche A3');
+  assert.ok(poster.svg.includes('1983'), 'Date de Justine manquante sur l’affiche A3');
+  assert.ok(poster.svg.includes('2012'), 'Date de décès de Peter manquante sur l’affiche A3');
+  assert.ok(poster.svg.includes('Anatole'), 'Prénom Anatole manquant sur l’affiche A3');
+  assert.ok(poster.svg.includes('Golay'), 'Nom Golay manquant sur l’affiche A3');
+  assert.ok(poster.svg.includes('data:image/jpeg;base64,'), 'Portrait local de Sophie manquant sur l’affiche A3');
+});
+
+
 

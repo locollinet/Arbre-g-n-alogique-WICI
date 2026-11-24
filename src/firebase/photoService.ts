@@ -5,11 +5,20 @@ import {
   deleteDoc,
   getDocs,
   getDoc,
-  onSnapshot
+  onSnapshot,
+  query,
+  where,
+  runTransaction
 } from 'firebase/firestore';
 import { db, auth } from './firebase';
 import { OperationType, handleFirestoreError, isQuotaExceededError } from './errors';
-import { Person, TreeSettings } from '../data/wiciFamily';
+import { Person, TreeSettings, DEFAULT_SETTINGS } from '../data/wiciFamily';
+import {
+  ArchiveState,
+  SyncOperation,
+  reconcileArchiveWithOutbox,
+  stripPeopleForStorage
+} from '../utils/syncEngine';
 
 export interface PersonPhotoRecord {
   personId: string;
@@ -31,16 +40,33 @@ const COLLECTION_NAME = 'personPhotos';
 const ARCHIVE_COLLECTION = 'familyArchive';
 const ARCHIVE_DOC_ID = 'main';
 
-// Circuit breaker: once Firestore reports daily write quota exhaustion, stop queuing
-// new writes in this session so the SDK never enters an infinite backoff retry loop.
+// Circuit breaker: once Firestore reports daily quota exhaustion, pause automatic background
+// writes so the SDK never enters an infinite backoff retry loop. Can be explicitly reset
+// by the user via manual retry or after cooldown.
 let firestoreWriteQuotaExceeded = false;
+let quotaExceededAtMs = 0;
+const QUOTA_AUTO_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes before allowing automatic retry
 
 export function isFirestoreWriteQuotaExceeded(): boolean {
+  if (firestoreWriteQuotaExceeded && Date.now() - quotaExceededAtMs > QUOTA_AUTO_COOLDOWN_MS) {
+    firestoreWriteQuotaExceeded = false;
+    quotaExceededAtMs = 0;
+  }
   return firestoreWriteQuotaExceeded;
 }
 
+export function markFirestoreQuotaExceeded(): void {
+  firestoreWriteQuotaExceeded = true;
+  quotaExceededAtMs = Date.now();
+}
+
+export function resetFirestoreQuotaBreaker(): void {
+  firestoreWriteQuotaExceeded = false;
+  quotaExceededAtMs = 0;
+}
+
 function assertWriteQuotaAvailable(path: string): void {
-  if (firestoreWriteQuotaExceeded) {
+  if (isFirestoreWriteQuotaExceeded()) {
     throw new Error(`FIRESTORE_WRITE_QUOTA_EXCEEDED (${path})`);
   }
 }
@@ -65,6 +91,7 @@ export async function savePersonPhotoToFirestore(params: {
   shape?: 'circle' | 'oval' | 'portrait' | 'square';
   filter?: 'none' | 'sepia' | 'bw' | 'warm';
   caption?: string;
+  updatedAt?: string;
 }): Promise<PersonPhotoRecord> {
   const validPersonId = sanitizePersonId(params.personId);
 
@@ -82,7 +109,7 @@ export async function savePersonPhotoToFirestore(params: {
     shape: params.shape || 'circle',
     filter: params.filter || 'none',
     caption: params.caption ? params.caption.slice(0, 256) : '',
-    updatedAt: new Date().toISOString(),
+    updatedAt: params.updatedAt || new Date().toISOString(),
   };
 
   const currentUser = auth.currentUser;
@@ -97,7 +124,7 @@ export async function savePersonPhotoToFirestore(params: {
     return record;
   } catch (error) {
     if (isQuotaExceededError(error)) {
-      firestoreWriteQuotaExceeded = true;
+      markFirestoreQuotaExceeded();
     }
     handleFirestoreError(error, OperationType.WRITE, `${COLLECTION_NAME}/${validPersonId}`);
   }
@@ -114,7 +141,7 @@ export async function deletePersonPhotoFromFirestore(personId: string): Promise<
     await deleteDoc(docRef);
   } catch (error) {
     if (isQuotaExceededError(error)) {
-      firestoreWriteQuotaExceeded = true;
+      markFirestoreQuotaExceeded();
     }
     handleFirestoreError(error, OperationType.DELETE, `${COLLECTION_NAME}/${validPersonId}`);
   }
@@ -131,12 +158,15 @@ export async function getPersonPhotoFromFirestore(personId: string): Promise<Per
     if (!snap.exists()) return null;
     return snap.data() as PersonPhotoRecord;
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markFirestoreQuotaExceeded();
+    }
     handleFirestoreError(error, OperationType.GET, `${COLLECTION_NAME}/${validPersonId}`);
   }
 }
 
 /**
- * Gets all stored person photos from Firestore
+ * Gets all stored person photos from Firestore (use sparingly — prefer delta listener)
  */
 export async function getAllPersonPhotosFromFirestore(): Promise<Record<string, PersonPhotoRecord>> {
   const colRef = collection(db, COLLECTION_NAME);
@@ -145,37 +175,65 @@ export async function getAllPersonPhotosFromFirestore(): Promise<Record<string, 
     const result: Record<string, PersonPhotoRecord> = {};
     snap.forEach((docSnap) => {
       const data = docSnap.data() as PersonPhotoRecord;
-      result[data.personId] = data;
+      if (data?.personId && data?.photoDataUrl) {
+        result[data.personId] = data;
+      }
     });
     return result;
   } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markFirestoreQuotaExceeded();
+    }
     handleFirestoreError(error, OperationType.LIST, COLLECTION_NAME);
   }
 }
 
 /**
- * Real-time listener for all person photos in the family tree
+ * Real-time listener for person photos in the family tree.
+ * When `sinceUpdatedAt` is provided (returning device with populated IndexedDB),
+ * queries ONLY photos updated after `sinceUpdatedAt` — reducing read units from
+ * thousands per reload down to 0 when no new photo has been uploaded!
  */
 export function subscribeToPersonPhotos(
-  onUpdate: (photosMap: Record<string, PersonPhotoRecord>, fromCache: boolean) => void,
-  onError?: (err: Error) => void
+  onUpdate: (
+    photosDeltaMap: Record<string, PersonPhotoRecord>,
+    meta: { fromCache: boolean; isFullSnapshot: boolean; maxUpdatedAt: string | null }
+  ) => void,
+  onError?: (err: Error) => void,
+  sinceUpdatedAt?: string | null
 ): () => void {
   const colRef = collection(db, COLLECTION_NAME);
+  const isFullSnapshot = !sinceUpdatedAt;
+  const targetQuery = sinceUpdatedAt
+    ? query(colRef, where('updatedAt', '>', sinceUpdatedAt))
+    : colRef;
+
   return onSnapshot(
-    colRef,
+    targetQuery,
     (snapshot) => {
       const map: Record<string, PersonPhotoRecord> = {};
+      let maxUpdatedAt: string | null = sinceUpdatedAt || null;
       snapshot.forEach((docSnap) => {
         const item = docSnap.data() as PersonPhotoRecord;
-        if (item.personId && item.photoDataUrl) {
+        if (item?.personId && item?.photoDataUrl) {
           map[item.personId] = item;
+          if (item.updatedAt && (!maxUpdatedAt || item.updatedAt > maxUpdatedAt)) {
+            maxUpdatedAt = item.updatedAt;
+          }
         }
       });
-      onUpdate(map, snapshot.metadata.fromCache);
+      onUpdate(map, {
+        fromCache: snapshot.metadata.fromCache,
+        isFullSnapshot,
+        maxUpdatedAt,
+      });
     },
     (error) => {
+      if (isQuotaExceededError(error)) {
+        markFirestoreQuotaExceeded();
+      }
       try {
-        handleFirestoreError(error, OperationType.GET, COLLECTION_NAME);
+        handleFirestoreError(error, OperationType.LIST, COLLECTION_NAME);
       } catch (e) {
         if (onError && e instanceof Error) onError(e);
       }
@@ -184,29 +242,70 @@ export function subscribeToPersonPhotos(
 }
 
 /**
- * Strips base64 photos and undefined values from Person array so the main archive doc stays lightweight (~8KB)
+ * Atomically commits a batch of SyncOperations to Firestore (familyArchive/main)
+ * inside a Firestore transaction.
+ *
+ * Why this eliminates partial saves & clobbered edits permanently:
+ * - Reads the latest live server document before applying our pending operations
+ * - Merges ONLY the modified person(s) / explicit relationship deltas / settings
+ * - If another family member edits a different person concurrently, Firestore
+ *   automatically retries the transaction so BOTH edits are preserved!
+ * - Batches multiple rapid edits into a single Firestore write.
  */
-function stripPeopleForArchive(people: Person[]): Person[] {
-  return people.map((p) => {
-    const clean: Person = {
-      id: p.id,
-      first: p.first || '',
-      last: p.last || '',
-      parents: Array.isArray(p.parents) ? p.parents : [],
-    };
-    if (p.maidenName) clean.maidenName = p.maidenName;
-    if (p.birth) clean.birth = p.birth;
-    if (p.death) clean.death = p.death;
-    if (p.location) clean.location = p.location;
-    if (p.occupation) clean.occupation = p.occupation;
-    if (p.spouses && p.spouses.length > 0) clean.spouses = p.spouses;
-    if (p.notes) clean.notes = p.notes;
-    return clean;
-  });
+export async function commitOperationsToFirestore(
+  ops: SyncOperation[],
+  fallbackArchive: ArchiveState
+): Promise<FamilyArchiveRecord> {
+  const docPath = `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`;
+  assertWriteQuotaAvailable(docPath);
+  const docRef = doc(db, ARCHIVE_COLLECTION, ARCHIVE_DOC_ID);
+
+  try {
+    const committed = await runTransaction(db, async (tx) => {
+      const snap = await tx.get(docRef);
+      const serverState: ArchiveState = snap.exists()
+        ? {
+            people: Array.isArray((snap.data() as FamilyArchiveRecord).people)
+              ? (snap.data() as FamilyArchiveRecord).people
+              : fallbackArchive.people,
+            settings: {
+              ...DEFAULT_SETTINGS,
+              ...((snap.data() as FamilyArchiveRecord).settings || {}),
+            },
+          }
+        : {
+            people: stripPeopleForStorage(fallbackArchive.people),
+            settings: { ...DEFAULT_SETTINGS, ...fallbackArchive.settings },
+          };
+
+      const nextState = reconcileArchiveWithOutbox(serverState, ops);
+      const cleanPeople = stripPeopleForStorage(nextState.people).slice(0, 500);
+      if (cleanPeople.length === 0) {
+        throw new Error('Archive vide refusée pour préserver la sécurité des données.');
+      }
+
+      const record: FamilyArchiveRecord = {
+        people: cleanPeople,
+        settings: JSON.parse(JSON.stringify(nextState.settings)),
+        updatedAt: new Date().toISOString(),
+      };
+
+      tx.set(docRef, record);
+      return record;
+    });
+
+    return committed;
+  } catch (error) {
+    if (isQuotaExceededError(error)) {
+      markFirestoreQuotaExceeded();
+    }
+    handleFirestoreError(error, OperationType.WRITE, docPath);
+  }
 }
 
 /**
  * Saves the complete family tree structure and settings to Firestore (familyArchive/main)
+ * Used only for initial seeding when the server document does not exist yet.
  */
 export async function saveFamilyArchiveToFirestore(
   people: Person[],
@@ -214,7 +313,7 @@ export async function saveFamilyArchiveToFirestore(
 ): Promise<FamilyArchiveRecord> {
   const docRef = doc(db, ARCHIVE_COLLECTION, ARCHIVE_DOC_ID);
   const record: FamilyArchiveRecord = {
-    people: stripPeopleForArchive(people),
+    people: stripPeopleForStorage(people).slice(0, 500),
     updatedAt: new Date().toISOString(),
   };
   if (settings) {
@@ -226,7 +325,7 @@ export async function saveFamilyArchiveToFirestore(
     return record;
   } catch (error) {
     if (isQuotaExceededError(error)) {
-      firestoreWriteQuotaExceeded = true;
+      markFirestoreQuotaExceeded();
     }
     handleFirestoreError(error, OperationType.WRITE, `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
   }
@@ -237,7 +336,7 @@ export async function saveFamilyArchiveToFirestore(
  * If the document doesn't exist yet on the server, onMissing() is called so the app can seed it automatically.
  */
 export function subscribeToFamilyArchive(
-  onUpdate: (record: FamilyArchiveRecord, fromCache: boolean) => void,
+  onUpdate: (record: FamilyArchiveRecord, meta: { fromCache: boolean; hasPendingWrites: boolean }) => void,
   onMissing?: () => void,
   onError?: (err: Error) => void
 ): () => void {
@@ -254,10 +353,16 @@ export function subscribeToFamilyArchive(
       }
       const data = snapshot.data() as FamilyArchiveRecord;
       if (data && Array.isArray(data.people) && data.people.length > 0) {
-        onUpdate(data, snapshot.metadata.fromCache);
+        onUpdate(data, {
+          fromCache: snapshot.metadata.fromCache,
+          hasPendingWrites: snapshot.metadata.hasPendingWrites,
+        });
       }
     },
     (error) => {
+      if (isQuotaExceededError(error)) {
+        markFirestoreQuotaExceeded();
+      }
       try {
         handleFirestoreError(error, OperationType.GET, `${ARCHIVE_COLLECTION}/${ARCHIVE_DOC_ID}`);
       } catch (e) {

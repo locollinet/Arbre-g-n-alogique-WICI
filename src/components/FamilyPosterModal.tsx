@@ -13,7 +13,9 @@ import {
   Info,
   LayoutGrid,
   Share2,
-  AlertCircle
+  AlertCircle,
+  CloudCheck,
+  RefreshCw
 } from 'lucide-react';
 import { Person, TreeSettings } from '../data/wiciFamily';
 import {
@@ -31,6 +33,9 @@ interface FamilyPosterModalProps {
   settings: TreeSettings;
   accentColor: string;
   onOpenShare?: () => void;
+  pendingSyncCount?: number;
+  cloudStatus?: 'chargement' | 'disponible' | 'synchronisation' | 'cache' | 'quota' | 'indisponible';
+  onForceSync?: () => Promise<boolean> | void;
 }
 
 export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
@@ -40,6 +45,9 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
   settings,
   accentColor,
   onOpenShare,
+  pendingSyncCount = 0,
+  cloudStatus,
+  onForceSync,
 }) => {
   const [posterStyle, setPosterStyle] = useState<'tree' | 'gallery'>('tree');
   const [orientation, setOrientation] = useState<'landscape' | 'portrait'>('landscape');
@@ -289,6 +297,33 @@ export const FamilyPosterModal: React.FC<FamilyPosterModalProps> = ({
               <label className="block text-xs font-semibold text-[#5A5248] uppercase tracking-wider">
                 4. Sortie & Impression
               </label>
+
+              {/* Sync reassurance banner right before PDF export */}
+              {pendingSyncCount > 0 ? (
+                <div className="p-2.5 rounded-xl bg-[#FDF6EE] border border-[#E5C9A8] text-[#7D4B1D] text-xs flex items-center justify-between gap-2">
+                  <div className="flex items-start gap-2 min-w-0">
+                    <AlertCircle className="h-4 w-4 shrink-0 mt-0.5 text-[#B46B27]" />
+                    <span className="leading-snug">
+                      <b>{pendingSyncCount} modification{pendingSyncCount > 1 ? 's' : ''}</b> enregistrée{pendingSyncCount > 1 ? 's' : ''} sur cet appareil (en attente d’envoi vers le cloud). Votre PDF inclut bien vos dernières modifications.
+                    </span>
+                  </div>
+                  {onForceSync && (
+                    <button
+                      type="button"
+                      onClick={() => void onForceSync()}
+                      className="px-2.5 py-1.5 rounded-lg bg-white border border-[#D8B994] text-[11px] font-semibold text-[#7D4B1D] hover:bg-[#FAF1E6] shrink-0 flex items-center gap-1"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${cloudStatus === 'synchronisation' ? 'animate-spin' : ''}`} />
+                      <span>Sync</span>
+                    </button>
+                  )}
+                </div>
+              ) : cloudStatus === 'disponible' ? (
+                <div className="px-3 py-2 rounded-xl bg-[#F0F7F2] border border-[#CDE5D5] text-[#2E6B3F] text-[11px] font-medium flex items-center gap-1.5">
+                  <CloudCheck className="h-3.5 w-3.5 shrink-0" />
+                  <span>Toutes les modifications sont synchronisées pour la famille.</span>
+                </div>
+              ) : null}
 
               <button
                 type="button"

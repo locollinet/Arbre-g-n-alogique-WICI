@@ -43,10 +43,11 @@ type ShapeType = 'circle' | 'oval' | 'portrait' | 'square';
 type FilterType = 'none' | 'sepia' | 'bw' | 'warm';
 
 const PREVIEW_DIM = 420;
-const MAX_EXPORT_DIM = 1200;
-const MIN_EXPORT_DIM = 640;
-// Firestore hard document limit is 1,048,576 bytes; keep ~98 KB headroom for metadata
-const MAX_FIRESTORE_PHOTO_CHARS = 950_000;
+const MAX_EXPORT_DIM = 512;
+const MIN_EXPORT_DIM = 360;
+// Keep portraits crisp for A3 300 DPI medallions (~160-220px) while staying ~35-80KB
+// (15x smaller than 1MB, slashing Firestore daily read/write units and speeding up 4G uploads)
+const MAX_FIRESTORE_PHOTO_CHARS = 140_000;
 
 export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   isOpen,
@@ -85,26 +86,35 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pinchRef = useRef<{ dist: number; startZoom: number } | null>(null);
 
-  // Initialize or reset when opened
+  // Initialize or reset ONLY when opening the modal or switching to a different person.
+  // Never depend on the whole `person` object reference, otherwise a background Firestore
+  // snapshot arriving while cropping would wipe out the user's newly picked photo and framing!
+  const initKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (isOpen) {
-      setErrorMessage(null);
-      setShape(initialShape || 'circle');
-      setFilter(initialFilter || 'none');
-      setCaption('');
-      setPan({ x: 0, y: 0 });
-      setZoom(1);
-      setRotation(0);
-
-      if (initialImageSrc) {
-        setImageSrc(initialImageSrc);
-      } else if (person.photo) {
-        setImageSrc(person.photo);
-      } else {
-        setImageSrc(null);
-      }
+    if (!isOpen) {
+      initKeyRef.current = null;
+      return;
     }
-  }, [isOpen, initialImageSrc, initialFilter, initialShape, person]);
+    const key = `${person.id}::${initialImageSrc ? initialImageSrc.slice(0, 64) : ''}`;
+    if (initKeyRef.current === key) return;
+    initKeyRef.current = key;
+
+    setErrorMessage(null);
+    setShape(initialShape || 'circle');
+    setFilter(initialFilter || 'none');
+    setCaption('');
+    setPan({ x: 0, y: 0 });
+    setZoom(1);
+    setRotation(0);
+
+    if (initialImageSrc) {
+      setImageSrc(initialImageSrc);
+    } else if (person.photo) {
+      setImageSrc(person.photo);
+    } else {
+      setImageSrc(null);
+    }
+  }, [isOpen, person.id, initialImageSrc, initialFilter, initialShape]);
 
   const [exportResolution, setExportResolution] = useState<number>(MAX_EXPORT_DIM);
 
@@ -296,9 +306,9 @@ export const PhotoCropperModal: React.FC<PhotoCropperModalProps> = ({
 
     const exportCanvas = document.createElement('canvas');
     const candidateDims = Array.from(
-      new Set([idealDim, Math.min(idealDim, 960), Math.min(idealDim, 768), PREVIEW_DIM])
+      new Set([idealDim, Math.min(idealDim, 480), Math.min(idealDim, 420), MIN_EXPORT_DIM])
     ).sort((a, b) => b - a);
-    const candidateQualities = [0.94, 0.91, 0.88, 0.84, 0.78];
+    const candidateQualities = [0.86, 0.82, 0.78, 0.72, 0.66];
 
     let bestUrl = '';
     let bestDim = idealDim;

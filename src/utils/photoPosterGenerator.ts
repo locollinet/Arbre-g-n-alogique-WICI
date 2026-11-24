@@ -590,23 +590,35 @@ export function printPhotoPoster(
       html, body {
         width: 100%;
         height: 100%;
+        max-width: 100vw;
+        max-height: 100vh;
+        overflow: hidden !important;
         margin: 0;
         padding: 0;
         background: #FAF8F5 !important;
         -webkit-print-color-adjust: exact !important;
         print-color-adjust: exact !important;
+        page-break-after: avoid;
+        break-after: avoid;
       }
       .no-print {
         display: none !important;
       }
       svg {
         display: block;
-        width: 100vw;
-        height: 100vh;
+        width: 100%;
+        height: 100%;
+        max-width: 100vw;
+        max-height: 100vh;
+        page-break-inside: avoid;
+        break-inside: avoid;
       }
     }
-    body {
+    html, body {
       margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
       background: #FAF8F5;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }

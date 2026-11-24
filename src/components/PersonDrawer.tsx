@@ -43,7 +43,7 @@ interface PersonDrawerProps {
   preselectedParentIds?: string[];
   people: Person[];
   onClose: () => void;
-  onSavePerson: (person: Person, childIdsToAttach?: string[]) => void;
+  onSavePerson: (person: Person, childIdsToAttach?: string[]) => Promise<boolean> | void;
   onDeletePerson: (id: string) => void;
   onSelectPerson: (id: string) => void;
   onFocusBranch: (id: string) => void;
@@ -93,6 +93,8 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   const [spouseQuery, setSpouseQuery] = useState('');
   const [showSpousePicker, setShowSpousePicker] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Photo Cropper Atelier state
@@ -100,12 +102,39 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
   const [cropperSource, setCropperSource] = useState<string | undefined>(undefined);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const bodyScrollRef = useRef<HTMLDivElement>(null);
 
   const preselectedParentIdsKey = (preselectedParentIds || []).join('|');
+
+  const hydrateFromExisting = (personObj: Person) => {
+    setErrorMsg(null);
+    setConfirmDelete(false);
+    setConfirmDiscard(false);
+    setParentQuery('');
+    setChildQuery('');
+    setSpouseQuery('');
+    setFirst(personObj.first || '');
+    setLast(personObj.last || '');
+    setBirth(personObj.birth || '');
+    setDeath(personObj.death || '');
+    setLocation(personObj.location || '');
+    setOccupation(personObj.occupation || '');
+    setNotes(personObj.notes || '');
+    setParents(personObj.parents || []);
+    setSpouses(personObj.spouses || []);
+    setShowSpousePicker((personObj.spouses || []).length > 0);
+    const currentKids = people
+      .filter((p) => (p.parents || []).includes(personObj.id))
+      .map((p) => p.id);
+    setChildrenIds(currentKids);
+    setPhoto(personObj.photo || '');
+  };
 
   useEffect(() => {
     setErrorMsg(null);
     setConfirmDelete(false);
+    setConfirmDiscard(false);
+    setIsSubmitting(false);
     setParentQuery('');
     setChildQuery('');
     setSpouseQuery('');
@@ -136,23 +165,50 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
       setPhoto('');
     } else if (existingPerson) {
       setMode('view');
-      setFirst(existingPerson.first || '');
-      setLast(existingPerson.last || '');
-      setBirth(existingPerson.birth || '');
-      setDeath(existingPerson.death || '');
-      setLocation(existingPerson.location || '');
-      setOccupation(existingPerson.occupation || '');
-      setNotes(existingPerson.notes || '');
-      setParents(existingPerson.parents || []);
-      setSpouses(existingPerson.spouses || []);
-      setShowSpousePicker((existingPerson.spouses || []).length > 0);
-      const currentKids = people
-        .filter((p) => (p.parents || []).includes(existingPerson.id))
-        .map((p) => p.id);
-      setChildrenIds(currentKids);
-      setPhoto(existingPerson.photo || '');
+      hydrateFromExisting(existingPerson);
     }
   }, [isOpen, personId, preselectedParentId, preselectedParentIdsKey]);
+
+  const enterEditMode = () => {
+    if (existingPerson) {
+      hydrateFromExisting(existingPerson);
+    }
+    setMode('edit');
+  };
+
+  const hasUnsavedChanges = (() => {
+    if (mode !== 'edit') return false;
+    if (isNew) {
+      return Boolean(first.trim() || birth.trim() || death.trim() || notes.trim() || photo);
+    }
+    if (!existingPerson) return false;
+    const sameArr = (a: string[], b: string[]) =>
+      a.length === b.length && a.every((v) => b.includes(v));
+    const currentKids = people
+      .filter((p) => (p.parents || []).includes(existingPerson.id))
+      .map((p) => p.id);
+    return (
+      first.trim() !== (existingPerson.first || '').trim() ||
+      last.trim() !== (existingPerson.last || '').trim() ||
+      birth.trim() !== (existingPerson.birth || '').trim() ||
+      death.trim() !== (existingPerson.death || '').trim() ||
+      location.trim() !== (existingPerson.location || '').trim() ||
+      occupation.trim() !== (existingPerson.occupation || '').trim() ||
+      notes.trim() !== (existingPerson.notes || '').trim() ||
+      !sameArr(parents, existingPerson.parents || []) ||
+      !sameArr(spouses, existingPerson.spouses || []) ||
+      !sameArr(childrenIds, currentKids)
+    );
+  })();
+
+  const handleRequestClose = () => {
+    if (hasUnsavedChanges && !confirmDiscard) {
+      setConfirmDiscard(true);
+      return;
+    }
+    setConfirmDiscard(false);
+    onClose();
+  };
 
   if (!isOpen || (!existingPerson && !isNew)) return null;
 
@@ -226,15 +282,12 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
 
   const handleRemoveCurrentPhoto = async () => {
     setPhoto('');
-    if (existingPerson) {
-      if (onRemovePhoto) {
-        try {
-          await onRemovePhoto(existingPerson.id);
-        } catch {
-          // ignore offline remove error
-        }
+    if (existingPerson && onRemovePhoto) {
+      try {
+        await onRemovePhoto(existingPerson.id);
+      } catch {
+        // ignore offline remove error
       }
-      onSavePerson({ ...existingPerson, photo: undefined });
     }
   };
 
@@ -282,47 +335,68 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     if (!first.trim()) {
-      setErrorMsg("Le prénom est requis.");
+      setErrorMsg("Le prénom est requis pour enregistrer la fiche.");
+      bodyScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
     const targetId = isNew
       ? `wici-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 5)}`
       : existingPerson!.id;
 
+    const cleanParents = Array.from(new Set(parents.filter((id) => id !== targetId)));
+    const cleanSpouses = Array.from(new Set(spouses.filter((id) => id !== targetId)));
+
     const updated: Person = {
       id: targetId,
       first: first.trim(),
       last: last.trim(),
+      maidenName: existingPerson?.maidenName,
       birth: birth.trim(),
       death: death.trim(),
       location: location.trim(),
       occupation: occupation.trim(),
       notes: notes.trim(),
-      parents,
-      spouses,
+      parents: cleanParents,
+      spouses: cleanSpouses,
       photo: photo || undefined,
     };
 
     const prospective = (isNew ? [...people, updated] : people.map(p => p.id === updated.id ? updated : p)).map(p => {
       if (p.id === updated.id) return p;
-      const linked = p.parents.includes(updated.id);
-      return childrenIds.includes(p.id) && !linked ? {...p, parents: [...p.parents, updated.id]} : !childrenIds.includes(p.id) && linked ? {...p, parents: p.parents.filter(id => id !== updated.id)} : p;
+      const linked = (p.parents || []).includes(updated.id);
+      return childrenIds.includes(p.id) && !linked
+        ? { ...p, parents: [...(p.parents || []), updated.id] }
+        : !childrenIds.includes(p.id) && linked
+        ? { ...p, parents: (p.parents || []).filter(id => id !== updated.id) }
+        : p;
     });
     const validationError = validatePeople(prospective);
-    if (validationError) { setErrorMsg(validationError); return; }
-    if (existingPerson && !photo && photosMap?.[existingPerson.id] && onRemovePhoto) {
-      try {
-        await onRemovePhoto(existingPerson.id);
-      } catch {
-        // Ignore offline delete error; local photo is already cleared
-      }
+    if (validationError) {
+      setErrorMsg(validationError);
+      bodyScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
     }
-    onSavePerson(updated, childrenIds);
-    if (isNew) {
-      onClose();
-    } else {
-      setMode('view');
+
+    setIsSubmitting(true);
+    setConfirmDiscard(false);
+    try {
+      if (existingPerson && (existingPerson.photo || photosMap?.[existingPerson.id]) && !photo && onRemovePhoto) {
+        try {
+          await onRemovePhoto(existingPerson.id);
+        } catch {
+          // Ignore offline delete error; local photo is already cleared
+        }
+      }
+      await onSavePerson(updated, childrenIds);
+      if (isNew) {
+        onClose();
+      } else {
+        setMode('view');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -414,7 +488,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
     <div className="fixed inset-0 z-50 flex items-end sm:items-stretch sm:justify-end bg-[#1C1917]/40 backdrop-blur-[2px] transition-opacity">
       <div
         className="fixed inset-0"
-        onClick={onClose}
+        onClick={handleRequestClose}
         aria-label="Fermer le panneau"
       />
       <aside className="relative z-10 flex h-[88vh] sm:h-full w-full max-w-xl flex-col bg-[#FAF8F5] text-[#1C1917] shadow-2xl rounded-t-3xl sm:rounded-none border-t sm:border-t-0 sm:border-l border-[#E6DFD3] overflow-hidden">
@@ -435,7 +509,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
             {!isNew && mode === 'view' && (
               <button
                 type="button"
-                onClick={() => setMode('edit')}
+                onClick={enterEditMode}
                 className="px-3.5 py-2 text-xs font-medium border border-[#D8CFC2] bg-[#FAF8F5] hover:bg-[#F0ECE3] text-[#1C1917] transition-colors whitespace-nowrap"
               >
                 Modifier la fiche
@@ -444,7 +518,10 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
             {!isNew && mode === 'edit' && (
               <button
                 type="button"
-                onClick={() => setMode('view')}
+                onClick={() => {
+                  if (existingPerson) hydrateFromExisting(existingPerson);
+                  setMode('view');
+                }}
                 className="px-3.5 py-2 text-xs font-medium border border-[#D8CFC2] bg-white hover:bg-[#F5F2EB] text-[#6E665C] transition-colors whitespace-nowrap"
               >
                 Aperçu
@@ -452,7 +529,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
             )}
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleRequestClose}
               className="flex h-10 w-10 items-center justify-center border border-transparent hover:border-[#E6DFD3] hover:bg-[#F5F2EB] text-[#6E665C] transition-colors"
               aria-label="Fermer"
             >
@@ -461,8 +538,36 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
           </div>
         </div>
 
+        {/* Unsaved edits guard bar */}
+        {confirmDiscard && mode === 'edit' && (
+          <div className="bg-[#FDF6EE] border-b border-[#E5C9A8] px-5 sm:px-7 py-3 flex flex-wrap items-center justify-between gap-2 text-xs text-[#7D4B1D]">
+            <span className="font-medium">
+              Vous avez des modifications non enregistrées sur cette fiche.
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDiscard(false)}
+                className="px-3 py-1.5 bg-white border border-[#D8B994] text-[#7D4B1D] font-medium hover:bg-[#FAF1E6]"
+              >
+                Continuer l’édition
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDiscard(false);
+                  onClose();
+                }}
+                className="px-3 py-1.5 text-[#992B15] font-medium hover:bg-[#FDF2F0]"
+              >
+                Quitter sans enregistrer
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Drawer Body */}
-        <div className="flex-1 overflow-y-auto px-5 sm:px-7 py-5 sm:py-6 space-y-6 sm:space-y-7">
+        <div ref={bodyScrollRef} className="flex-1 overflow-y-auto px-5 sm:px-7 py-5 sm:py-6 space-y-6 sm:space-y-7">
           {mode === 'view' && existingPerson ? (
             <>
               {/* Hero Portrait Card */}
@@ -613,7 +718,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                   </span>
                   <button
                     type="button"
-                    onClick={() => setMode('edit')}
+                    onClick={enterEditMode}
                     className="text-xs text-[#8C7A65] hover:text-[#1C1917] underline underline-offset-4"
                   >
                     Éditer
@@ -910,9 +1015,11 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
                   </label>
                   <input
                     type="text"
-                    required
                     value={first}
-                    onChange={(e) => setFirst(e.target.value)}
+                    onChange={(e) => {
+                      setFirst(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
                     placeholder="Ex: Victoria"
                     className="w-full h-10 px-3 bg-[#FAF8F5] border border-[#D8CFC2] text-sm text-[#1C1917] focus:outline-none focus:border-[#8C7355]"
                   />
@@ -1300,7 +1407,13 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
         </div>
 
         {/* Drawer Footer */}
-        <div className="border-t border-[#E6DFD3] bg-white px-5 sm:px-7 py-3.5 sm:py-4 flex items-center justify-between gap-2.5 sm:gap-3 shrink-0">
+        <div className="border-t border-[#E6DFD3] bg-white px-5 sm:px-7 py-3.5 sm:py-4 shrink-0 space-y-2.5">
+          {mode === 'edit' && errorMsg && (
+            <div className="p-2.5 bg-[#FDF2F0] border border-[#E6B8B0] text-xs text-[#8C2D19] font-medium">
+              {errorMsg}
+            </div>
+          )}
+          <div className="flex items-center justify-between gap-2.5 sm:gap-3">
           {mode === 'edit' ? (
             <>
               {!isNew && existingPerson ? (
@@ -1341,18 +1454,27 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
               <div className="flex items-center gap-2.5">
                 <button
                   type="button"
-                  onClick={() => (isNew ? onClose() : setMode('view'))}
-                  className="px-4 py-2 text-xs font-medium border border-[#D8CFC2] bg-white hover:bg-[#F5F2EB] text-[#575047] transition-colors whitespace-nowrap"
+                  disabled={isSubmitting}
+                  onClick={() => {
+                    if (isNew) {
+                      handleRequestClose();
+                    } else {
+                      if (existingPerson) hydrateFromExisting(existingPerson);
+                      setMode('view');
+                    }
+                  }}
+                  className="px-4 py-2 text-xs font-medium border border-[#D8CFC2] bg-white hover:bg-[#F5F2EB] text-[#575047] transition-colors whitespace-nowrap disabled:opacity-50"
                 >
                   Annuler
                 </button>
                 <button
                   type="submit"
                   form="person-edit-form"
-                  className="px-5 py-2 text-xs font-medium text-white transition-colors whitespace-nowrap"
+                  disabled={isSubmitting}
+                  className="px-5 py-2 text-xs font-medium text-white transition-colors whitespace-nowrap disabled:opacity-60"
                   style={{ backgroundColor: accentColor }}
                 >
-                  Enregistrer dans l’arbre
+                  {isSubmitting ? 'Enregistrement…' : 'Enregistrer dans l’arbre'}
                 </button>
               </div>
             </>
@@ -1363,7 +1485,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
               </span>
               <button
                 type="button"
-                onClick={() => setMode('edit')}
+                onClick={enterEditMode}
                 className="px-4 py-2 text-xs font-medium text-white transition-colors whitespace-nowrap"
                 style={{ backgroundColor: accentColor }}
               >
@@ -1371,6 +1493,7 @@ export const PersonDrawer: React.FC<PersonDrawerProps> = ({
               </button>
             </div>
           )}
+          </div>
         </div>
 
         {/* Hidden File Input for Direct Photo Selection */}

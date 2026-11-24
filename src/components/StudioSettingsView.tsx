@@ -148,7 +148,6 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
       death: inlineDeath.trim(),
     });
     setInlineEditId(null);
-    onNotify(`Fiche de ${inlineFirst.trim()} ${inlineLast.trim()} mise à jour.`);
   };
 
   // JSON Export
@@ -601,7 +600,7 @@ export const StudioSettingsView: React.FC<StudioSettingsViewProps> = ({
                 Haute Définition & Légèreté
               </span>
               <p className="font-serif text-3xl text-[#1C1917] mt-1 font-mono tabular-nums">
-                ~28 <span className="text-sm font-sans text-[#8C7A65] font-normal">Ko / photo</span>
+                ~45 <span className="text-sm font-sans text-[#8C7A65] font-normal">Ko / photo</span>
               </p>
               <p className="text-xs text-[#6E665C] mt-1">
                 Compression Retina automatique avec filtres sépia d'époque et médaillons d'orfèvre.

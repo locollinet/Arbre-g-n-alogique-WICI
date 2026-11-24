@@ -18,9 +18,13 @@ import {
   Smartphone,
   Network,
   CloudCheck,
+  CloudOff,
+  RefreshCw,
   UserPlus,
   Sparkles,
-  Share2
+  Share2,
+  AlertCircle,
+  Check
 } from 'lucide-react';
 import { FamilyPosterModal } from './components/FamilyPosterModal';
 import { ShareFamilyModal } from './components/ShareFamilyModal';
@@ -38,61 +42,167 @@ import {
   deletePersonPhotoFromFirestore,
   subscribeToFamilyArchive,
   saveFamilyArchiveToFirestore,
+  commitOperationsToFirestore,
   isFirestoreWriteQuotaExceeded,
+  markFirestoreQuotaExceeded,
+  resetFirestoreQuotaBreaker,
   PersonPhotoRecord
 } from './firebase/photoService';
+import {
+  ArchiveState,
+  SyncOperation,
+  PendingPhotoOperation,
+  buildUpsertPersonOp,
+  createOpId,
+  enqueueOperation,
+  removeCommittedOperations,
+  reconcileArchiveWithOutbox,
+  stripPeopleForStorage,
+  loadOutboxFromStorage,
+  saveOutboxToStorage,
+  loadPendingPhotoOps,
+  savePendingPhotoOps,
+  upsertPendingPhotoOp,
+  hasCompletedInitialFullPhotoSync,
+  markInitialFullPhotoSyncDone,
+  loadLastPhotoSyncTimestamp,
+  saveLastPhotoSyncTimestamp,
+  clearLastPhotoSyncTimestamp,
+  computeSafeDeltaWatermark
+} from './utils/syncEngine';
+
+function withNetworkTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`NETWORK_TIMEOUT:${label}`)), ms);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+function waitBriefly<T>(promise: Promise<T>, ms: number): Promise<{ done: true; value: T } | { done: false }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        resolve({ done: false });
+      }
+    }, ms);
+    promise.then(
+      (value) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve({ done: true, value });
+        }
+      },
+      () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve({ done: true, value: false as unknown as T });
+        }
+      }
+    );
+  });
+}
 
 const STORAGE_PEOPLE_KEY = 'wici-archive-people-v2';
 const STORAGE_SETTINGS_KEY = 'wici-archive-settings-v2';
+
+export type CloudSyncStatus =
+  | 'chargement'
+  | 'disponible'
+  | 'synchronisation'
+  | 'cache'
+  | 'quota'
+  | 'indisponible';
+
+function loadInitialPeopleFromLocal(): Person[] {
+  try {
+    const savedV2 = localStorage.getItem(STORAGE_PEOPLE_KEY);
+    if (savedV2) {
+      const parsed = JSON.parse(savedV2);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        return stripPeopleForStorage(parsed);
+      }
+    }
+    const legacy = localStorage.getItem('wici-tree-v1');
+    if (legacy) {
+      const parsedLegacy = JSON.parse(legacy);
+      if (Array.isArray(parsedLegacy) && parsedLegacy.length > 0) {
+        return stripPeopleForStorage(parsedLegacy);
+      }
+    }
+  } catch {
+    // Fallback to initial seed
+  }
+  return stripPeopleForStorage(INITIAL_WICI_PEOPLE);
+}
+
+function loadInitialSettingsFromLocal(): TreeSettings {
+  try {
+    const saved = localStorage.getItem(STORAGE_SETTINGS_KEY);
+    if (saved) {
+      return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
+    }
+  } catch {
+    // Fallback
+  }
+  return DEFAULT_SETTINGS;
+}
+
+const SEED_PHOTOS_BY_ID: Record<string, string> = Object.fromEntries(
+  INITIAL_WICI_PEOPLE.filter((p) => !!p.photo).map((p) => [p.id, p.photo!])
+);
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'tree' | 'branches' | 'settings'>('tree');
   const [focusBranch, setFocusBranch] = useState<string>('all');
 
-  const [people, setPeople] = useState<Person[]>(() => {
-    const seedPhotos = new Map(
-      INITIAL_WICI_PEOPLE.filter((p) => !!p.photo).map((p) => [p.id, p.photo])
-    );
-    try {
-      const savedV2 = localStorage.getItem(STORAGE_PEOPLE_KEY);
-      if (savedV2) {
-        const parsed = JSON.parse(savedV2);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          return parsed.map((p: Person) => ({
-            ...p,
-            photo: p.photo || seedPhotos.get(p.id),
-          }));
-        }
-      }
-      const legacy = localStorage.getItem('wici-tree-v1');
-      if (legacy) {
-        const parsedLegacy = JSON.parse(legacy);
-        if (Array.isArray(parsedLegacy) && parsedLegacy.length > 0) {
-          return parsedLegacy.map((p: Person) => ({
-            ...p,
-            photo: p.photo || seedPhotos.get(p.id),
-          }));
-        }
-      }
-    } catch {
-      // Fallback to initial seed
-    }
-    return INITIAL_WICI_PEOPLE;
+  // Initialize server baseline + persistent outbox so unsynced offline edits survive reloads
+  const initialOutbox = useRef<SyncOperation[]>(loadOutboxFromStorage());
+  const initialPendingPhotos = useRef<PendingPhotoOperation[]>(loadPendingPhotoOps());
+  const serverArchiveRef = useRef<ArchiveState>({
+    people: loadInitialPeopleFromLocal(),
+    settings: loadInitialSettingsFromLocal(),
   });
+
+  const photoCacheRef = useRef<Record<string, string>>({ ...SEED_PHOTOS_BY_ID });
+  const pendingPhotosRef = useRef<PendingPhotoOperation[]>(initialPendingPhotos.current);
+  const outboxRef = useRef<SyncOperation[]>(initialOutbox.current);
+
+  const hydratePhotosOnPeople = useCallback((list: Person[]): Person[] => {
+    const pendingDeletes = new Set(
+      pendingPhotosRef.current.filter((o) => o.action === 'delete').map((o) => o.personId)
+    );
+    return list.map((p) => {
+      if (pendingDeletes.has(p.id)) {
+        return { ...p, photo: undefined };
+      }
+      const cached = photoCacheRef.current[p.id];
+      return cached ? { ...p, photo: cached } : { ...p, photo: undefined };
+    });
+  }, []);
+
+  const initialReconciled = useRef<ArchiveState>(
+    reconcileArchiveWithOutbox(serverArchiveRef.current, outboxRef.current)
+  );
+
+  const [people, setPeople] = useState<Person[]>(() =>
+    hydratePhotosOnPeople(initialReconciled.current.people)
+  );
+  const [settings, setSettings] = useState<TreeSettings>(() => initialReconciled.current.settings);
 
   const [mobileViewMode, setMobileViewMode] = useState<'touch' | 'canvas'>('canvas');
-
-  const [settings, setSettings] = useState<TreeSettings>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_SETTINGS_KEY);
-      if (saved) {
-        return { ...DEFAULT_SETTINGS, ...JSON.parse(saved) };
-      }
-    } catch {
-      // Fallback
-    }
-    return DEFAULT_SETTINGS;
-  });
 
   // Slide-over drawer state
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -103,17 +213,30 @@ export default function App() {
   // Standalone Photo Cropper Atelier state
   const [cropperPersonId, setCropperPersonId] = useState<string | null>(null);
 
-  // Standalone A3 Art Poster & Share Modals
+  // Standalone A3 Art Poster, Share & Sync Status Popover
   const [posterModalOpen, setPosterModalOpen] = useState(false);
   const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [syncPopoverOpen, setSyncPopoverOpen] = useState(false);
 
-  // Firebase Cloud Data state (No Auth required — direct link sharing)
+  // Cloud Sync State
   const [photosMap, setPhotosMap] = useState<Record<string, PersonPhotoRecord>>({});
   const lastCloudPhotos = useRef<Record<string, PersonPhotoRecord>>({});
-  const [cloudStatus, setCloudStatus] = useState<'chargement' | 'disponible' | 'cache' | 'quota' | 'indisponible'>('chargement');
+  const [cloudStatus, setCloudStatus] = useState<CloudSyncStatus>('chargement');
+  const [pendingOutboxCount, setPendingOutboxCount] = useState<number>(outboxRef.current.length);
+  const [pendingPhotosCount, setPendingPhotosCount] = useState<number>(
+    pendingPhotosRef.current.length
+  );
+  const [photoSubVersion, setPhotoSubVersion] = useState<number>(0);
+
   const hasSeededArchiveRef = useRef(false);
-  const hasReconciledInitialSeedRef = useRef(false);
+  const isFlushingRef = useRef(false);
+  const activeFlushPromiseRef = useRef<Promise<boolean> | null>(null);
+  const needsAnotherFlushRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const retryAttemptsRef = useRef(0);
   const settingsSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingSettingsPartialRef = useRef<Partial<TreeSettings>>({});
+  const flushQueueRef = useRef<(opts?: { manual?: boolean }) => Promise<boolean>>(async () => false);
 
   const peopleRef = useRef<Person[]>(people);
   useEffect(() => {
@@ -127,173 +250,345 @@ export default function App() {
 
   // Subtle toast notification
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-
   const notify = useCallback((msg: string) => {
     setToastMsg(msg);
   }, []);
 
-  // Helper to persist tree changes to Firestore and report real status
-  const syncTreeToCloud = useCallback(
-    async (nextPeople: Person[], nextSettings: TreeSettings): Promise<boolean> => {
-      if (isFirestoreWriteQuotaExceeded()) {
-        setCloudStatus('quota');
-        return false;
-      }
-      try {
-        await saveFamilyArchiveToFirestore(nextPeople, nextSettings);
-        setCloudStatus('disponible');
-        return true;
-      } catch (err) {
-        if (isQuotaExceededError(err)) {
-          setCloudStatus('quota');
-          console.warn('Quota journalier d’écriture Firestore atteint ; sauvegarde locale conservée.');
-        } else {
-          console.error('Erreur synchronisation Firestore:', err);
-          setCloudStatus('indisponible');
+  /**
+   * Recomputes the UI state strictly as:
+   *   reconcileArchiveWithOutbox(serverArchiveRef, outboxRef) + local/cloud photos.
+   * Guarantees that incoming Firestore snapshots NEVER wipe out unsynced local edits!
+   */
+  const recomputeDisplayedState = useCallback(() => {
+    const merged = reconcileArchiveWithOutbox(serverArchiveRef.current, outboxRef.current);
+    const withPhotos = hydratePhotosOnPeople(merged.people);
+    peopleRef.current = withPhotos;
+    settingsRef.current = merged.settings;
+    setPeople(withPhotos);
+    setSettings(merged.settings);
+  }, [hydratePhotosOnPeople]);
+
+  const persistOutboxState = useCallback((nextOutbox: SyncOperation[]) => {
+    outboxRef.current = nextOutbox;
+    saveOutboxToStorage(nextOutbox);
+    setPendingOutboxCount(nextOutbox.length);
+  }, []);
+
+  const persistPendingPhotosState = useCallback((nextPending: PendingPhotoOperation[]) => {
+    pendingPhotosRef.current = nextPending;
+    savePendingPhotoOps(nextPending);
+    setPendingPhotosCount(nextPending.length);
+  }, []);
+
+  /**
+   * Single-flight transactional sync worker with promise coalescing.
+   * - Never falsely returns `false` when called while another flush is already in flight:
+   *   instead, it awaits the active pass and runs a follow-up pass for newly arrived ops.
+   * - Guards every network call with a 15s timeout so a stalled 4G socket never deadlocks the worker.
+   */
+  const flushSyncQueue = useCallback(
+    async (options?: { manual?: boolean }): Promise<boolean> => {
+      const manual = !!options?.manual;
+      if (manual) {
+        resetFirestoreQuotaBreaker();
+        retryAttemptsRef.current = 0;
+        if (retryTimerRef.current) {
+          clearTimeout(retryTimerRef.current);
+          retryTimerRef.current = null;
         }
-        return false;
       }
+
+      while (activeFlushPromiseRef.current) {
+        needsAnotherFlushRef.current = true;
+        await activeFlushPromiseRef.current;
+        if (outboxRef.current.length === 0 && pendingPhotosRef.current.length === 0) {
+          return true;
+        }
+        if (isFirestoreWriteQuotaExceeded() && !manual) {
+          return false;
+        }
+      }
+
+      const runPass = async (): Promise<boolean> => {
+        const hasWork = outboxRef.current.length > 0 || pendingPhotosRef.current.length > 0;
+        if (!hasWork) {
+          if (!isFirestoreWriteQuotaExceeded()) {
+            setCloudStatus((prev) =>
+              prev === 'indisponible' || prev === 'quota' ? 'disponible' : prev
+            );
+          }
+          return true;
+        }
+
+        if (isFirestoreWriteQuotaExceeded()) {
+          setCloudStatus('quota');
+          return false;
+        }
+
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          setCloudStatus('indisponible');
+          return false;
+        }
+
+        isFlushingRef.current = true;
+        setCloudStatus('synchronisation');
+
+        let allSucceeded = true;
+
+        try {
+          // 1. Drain archive operations in batched Firestore transactions
+          while (outboxRef.current.length > 0) {
+            const batch = [...outboxRef.current];
+            const batchIds = new Set(batch.map((o) => o.opId));
+            const committed = await withNetworkTimeout(
+              commitOperationsToFirestore(batch, serverArchiveRef.current),
+              15000,
+              'archive-tx'
+            );
+
+            serverArchiveRef.current = {
+              people: stripPeopleForStorage(committed.people),
+              settings: { ...DEFAULT_SETTINGS, ...(committed.settings || {}) },
+            };
+
+            const remaining = removeCommittedOperations(outboxRef.current, batchIds);
+            persistOutboxState(remaining);
+            recomputeDisplayedState();
+          }
+
+          // 2. Drain pending photo uploads/deletions (photos are safely stored in IndexedDB)
+          while (pendingPhotosRef.current.length > 0) {
+            const localIdbPhotos = await getAllPhotosFromIndexedDb();
+            const snapshotOps = [...pendingPhotosRef.current];
+
+            for (const pOp of snapshotOps) {
+              if (pOp.action === 'upsert') {
+                const stored = localIdbPhotos[pOp.personId];
+                const dataUrl = stored?.photoDataUrl || photoCacheRef.current[pOp.personId];
+                if (!dataUrl) {
+                  persistPendingPhotosState(
+                    pendingPhotosRef.current.filter(
+                      (o) => !(o.personId === pOp.personId && o.updatedAt === pOp.updatedAt)
+                    )
+                  );
+                  continue;
+                }
+                const savedRec = await withNetworkTimeout(
+                  savePersonPhotoToFirestore({
+                    personId: pOp.personId,
+                    photoDataUrl: dataUrl,
+                    shape: (stored?.shape as PersonPhotoRecord['shape']) || 'circle',
+                    filter: (stored?.filter as PersonPhotoRecord['filter']) || 'none',
+                    caption: stored?.caption,
+                    updatedAt: stored?.updatedAt || pOp.updatedAt,
+                  }),
+                  20000,
+                  `photo-upsert-${pOp.personId}`
+                );
+                lastCloudPhotos.current = { ...lastCloudPhotos.current, [pOp.personId]: savedRec };
+                setPhotosMap((prev) => ({ ...prev, [pOp.personId]: savedRec }));
+                // Only advance watermark if initial full photo sync has already completed!
+                if (savedRec.updatedAt && hasCompletedInitialFullPhotoSync()) {
+                  const prevTs = loadLastPhotoSyncTimestamp();
+                  if (!prevTs || savedRec.updatedAt > prevTs) {
+                    saveLastPhotoSyncTimestamp(savedRec.updatedAt);
+                  }
+                }
+                persistPendingPhotosState(
+                  pendingPhotosRef.current.filter(
+                    (o) => !(o.personId === pOp.personId && o.updatedAt === pOp.updatedAt)
+                  )
+                );
+              } else if (pOp.action === 'delete') {
+                await withNetworkTimeout(
+                  deletePersonPhotoFromFirestore(pOp.personId),
+                  15000,
+                  `photo-delete-${pOp.personId}`
+                );
+                const nextCloud = { ...lastCloudPhotos.current };
+                delete nextCloud[pOp.personId];
+                lastCloudPhotos.current = nextCloud;
+                setPhotosMap((prev) => {
+                  const next = { ...prev };
+                  delete next[pOp.personId];
+                  return next;
+                });
+                persistPendingPhotosState(
+                  pendingPhotosRef.current.filter(
+                    (o) => !(o.personId === pOp.personId && o.updatedAt === pOp.updatedAt)
+                  )
+                );
+              }
+            }
+          }
+
+          retryAttemptsRef.current = 0;
+          setCloudStatus('disponible');
+        } catch (err) {
+          allSucceeded = false;
+          if (isQuotaExceededError(err)) {
+            setCloudStatus('quota');
+            console.warn(
+              'Quota journalier Firebase atteint : vos modifications restent en sécurité dans la file locale.'
+            );
+          } else {
+            setCloudStatus('indisponible');
+            console.warn('Synchronisation Firebase différée (reprise automatique):', err);
+            const delays = [3000, 8000, 20000, 45000];
+            const delay = delays[Math.min(retryAttemptsRef.current, delays.length - 1)];
+            retryAttemptsRef.current += 1;
+            if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = setTimeout(() => {
+              retryTimerRef.current = null;
+              void flushQueueRef.current();
+            }, delay);
+          }
+        } finally {
+          isFlushingRef.current = false;
+        }
+
+        return allSucceeded;
+      };
+
+      const passPromise = runPass();
+      activeFlushPromiseRef.current = passPromise;
+      let result = false;
+      try {
+        result = await passPromise;
+      } finally {
+        if (activeFlushPromiseRef.current === passPromise) {
+          activeFlushPromiseRef.current = null;
+        }
+      }
+
+      if (
+        (needsAnotherFlushRef.current ||
+          outboxRef.current.length > 0 ||
+          pendingPhotosRef.current.length > 0) &&
+        result &&
+        !isFirestoreWriteQuotaExceeded()
+      ) {
+        needsAnotherFlushRef.current = false;
+        return flushSyncQueue();
+      }
+      needsAnotherFlushRef.current = false;
+      return result;
     },
-    []
+    [persistOutboxState, persistPendingPhotosState, recomputeDisplayedState]
   );
 
-  // 1. Initial connection test to Firestore & local IndexedDB photos load on boot
   useEffect(() => {
-    testConnection().catch(() => {
-      // Offline fallback
+    flushQueueRef.current = flushSyncQueue;
+  }, [flushSyncQueue]);
+
+  /**
+   * Enqueues a single archive SyncOperation, updates UI optimistically,
+   * persists to outbox immediately, and triggers the transactional sync worker.
+   */
+  const dispatchArchiveOp = useCallback(
+    async (op: SyncOperation): Promise<boolean> => {
+      const nextOutbox = enqueueOperation(outboxRef.current, op);
+      persistOutboxState(nextOutbox);
+      recomputeDisplayedState();
+      return flushSyncQueue();
+    },
+    [persistOutboxState, recomputeDisplayedState, flushSyncQueue]
+  );
+
+  // 1. Boot: connectivity check, online/visibility auto-retry, & IndexedDB portrait hydration
+  useEffect(() => {
+    void testConnection().then((state) => {
+      if (state === 'quota') {
+        markFirestoreQuotaExceeded();
+        setCloudStatus('quota');
+      } else if (state === 'offline') {
+        setCloudStatus('indisponible');
+      }
     });
 
-    // Load any photos saved in IndexedDB (immune to 5MB localStorage quota)
-    getAllPhotosFromIndexedDb()
-      .then((localMap) => {
-        if (Object.keys(localMap).length > 0) {
-          setPeople((prev) => {
-            let changed = false;
-            const next = prev.map((p) => {
-              const localPhoto = localMap[p.id]?.photoDataUrl;
-              if (localPhoto && !p.photo) {
-                changed = true;
-                return { ...p, photo: localPhoto };
-              }
-              return p;
-            });
-            if (changed) {
-              peopleRef.current = next;
-              return next;
-            }
-            return prev;
-          });
+    const handleOnline = () => {
+      void flushQueueRef.current();
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (outboxRef.current.length > 0 || pendingPhotosRef.current.length > 0) {
+          void flushQueueRef.current();
         }
-      })
-      .catch((err) => {
-        console.warn('Chargement IndexedDB:', err);
-      });
-
-    // Deep local-only auto-recovery of any photos from browser cache (localStorage or IndexedDB).
-    // IMPORTANT: never push cached photos back to Firestore automatically on boot —
-    // doing so burns daily write units on every page load. Photos are synced to Firestore
-    // only when explicitly uploaded or edited by the user.
-    runFullPhotoRecovery(peopleRef.current).then(({ recoveredPhotos }) => {
-      const recoveredIds = Object.keys(recoveredPhotos);
-      if (recoveredIds.length === 0) return;
-
-      setPeople((prev) => {
-        let changed = false;
-        const next = prev.map((p) => {
-          const salvaged = recoveredPhotos[p.id];
-          if (salvaged && !p.photo) {
-            changed = true;
-            return { ...p, photo: salvaged };
-          }
-          return p;
-        });
-        if (changed) {
-          peopleRef.current = next;
-          return next;
-        }
-        return prev;
-      });
-    });
-
-    return () => {
+      }
+    };
+    const flushPendingSettingsToOutboxSync = () => {
       if (settingsSyncTimerRef.current) {
         clearTimeout(settingsSyncTimerRef.current);
+        settingsSyncTimerRef.current = null;
       }
+      const pendingPartial = pendingSettingsPartialRef.current;
+      if (Object.keys(pendingPartial).length > 0) {
+        pendingSettingsPartialRef.current = {};
+        const nextOutbox = enqueueOperation(outboxRef.current, {
+          opId: createOpId(),
+          createdAt: new Date().toISOString(),
+          type: 'UPDATE_SETTINGS',
+          partial: pendingPartial,
+        });
+        outboxRef.current = nextOutbox;
+        saveOutboxToStorage(nextOutbox);
+      }
+    };
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      flushPendingSettingsToOutboxSync();
+      if (isFlushingRef.current) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+
+    window.addEventListener('online', handleOnline);
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    window.addEventListener('pagehide', flushPendingSettingsToOutboxSync);
+
+    // Flush any leftover pending operations saved from an earlier offline/quota session
+    if (outboxRef.current.length > 0 || pendingPhotosRef.current.length > 0) {
+      void flushQueueRef.current();
+    }
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      window.removeEventListener('pagehide', flushPendingSettingsToOutboxSync);
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
+      if (settingsSyncTimerRef.current) clearTimeout(settingsSyncTimerRef.current);
     };
   }, []);
 
   // 2. Subscribe to real-time Family Archive (people + settings) in Firestore
   useEffect(() => {
-    const initialIds = new Set(INITIAL_WICI_PEOPLE.map((p) => p.id));
-
     const unsub = subscribeToFamilyArchive(
-      (archiveRecord, fromCache) => {
-        if (!isFirestoreWriteQuotaExceeded()) {
-          setCloudStatus(fromCache ? 'cache' : 'disponible');
-        }
-        if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
-          // If the cloud doc only has the untouched default seed while this browser
-          // still holds locally added members (added before cloud was connected),
-          // preserve and push those local members up to Firestore once.
-          if (!fromCache && !hasReconciledInitialSeedRef.current) {
-            hasReconciledInitialSeedRef.current = true;
-            const cloudIds = new Set(archiveRecord.people.map((p) => p.id));
-            const cloudIsOnlyDefaultSeed =
-              archiveRecord.people.length === INITIAL_WICI_PEOPLE.length &&
-              archiveRecord.people.every((p) => initialIds.has(p.id));
-            const localExtraMembers = peopleRef.current.filter(
-              (p) => !initialIds.has(p.id) && !cloudIds.has(p.id)
-            );
-
-            if (cloudIsOnlyDefaultSeed && localExtraMembers.length > 0 && !isFirestoreWriteQuotaExceeded()) {
-              const mergedPeople = [...archiveRecord.people, ...localExtraMembers].map((cp) => ({
-                ...cp,
-                photo:
-                  lastCloudPhotos.current[cp.id]?.photoDataUrl ||
-                  peopleRef.current.find((lp) => lp.id === cp.id)?.photo ||
-                  cp.photo,
-              }));
-              peopleRef.current = mergedPeople;
-              setPeople(mergedPeople);
-              void saveFamilyArchiveToFirestore(mergedPeople, settingsRef.current)
-                .then(() => {
-                  setCloudStatus('disponible');
-                  notify(
-                    `${localExtraMembers.length} membre(s) local(aux) synchronisé(s) vers le cloud.`
-                  );
-                })
-                .catch((err) => {
-                  if (isQuotaExceededError(err)) {
-                    setCloudStatus('quota');
-                  } else {
-                    console.error('Erreur fusion initiale Firestore:', err);
-                  }
-                });
-              return;
-            }
+      (archiveRecord, meta) => {
+        if (!isFirestoreWriteQuotaExceeded() && !isFlushingRef.current) {
+          if (outboxRef.current.length === 0 && pendingPhotosRef.current.length === 0) {
+            setCloudStatus(meta.fromCache ? 'cache' : 'disponible');
           }
-
-          setPeople((prev) => {
-            // Merge cloud people with currently loaded photos without losing local portraits
-            const prevPhotos = new Map(prev.map((p) => [p.id, p.photo]));
-            const cloudPhotos = lastCloudPhotos.current;
-            const next = archiveRecord.people.map((cp) => ({
-              ...cp,
-              photo: cloudPhotos[cp.id]?.photoDataUrl || prevPhotos.get(cp.id) || cp.photo,
-            }));
-            peopleRef.current = next;
-            return next;
-          });
         }
-        if (archiveRecord.settings) {
-          setSettings((prev) => ({ ...prev, ...archiveRecord.settings }));
+
+        if (Array.isArray(archiveRecord.people) && archiveRecord.people.length > 0) {
+          serverArchiveRef.current = {
+            people: stripPeopleForStorage(archiveRecord.people),
+            settings: {
+              ...DEFAULT_SETTINGS,
+              ...(archiveRecord.settings || serverArchiveRef.current.settings),
+            },
+          };
+          // Always re-apply any pending local outbox edits on top of the server baseline!
+          recomputeDisplayedState();
         }
       },
       () => {
-        // Document doesn't exist yet on Firestore: seed the database with our initial copy!
+        // Document doesn't exist yet on Firestore: seed once
         if (!hasSeededArchiveRef.current && !isFirestoreWriteQuotaExceeded()) {
           hasSeededArchiveRef.current = true;
-          hasReconciledInitialSeedRef.current = true;
           saveFamilyArchiveToFirestore(peopleRef.current, settingsRef.current)
             .then(() => setCloudStatus('disponible'))
             .catch((err) => {
@@ -310,86 +605,170 @@ export default function App() {
         if (isQuotaExceededError(err)) {
           setCloudStatus('quota');
         } else {
-          console.error('Erreur synchronisation archive Firestore:', err);
+          console.warn('Synchronisation archive Firestore:', err);
           setCloudStatus('indisponible');
         }
       }
     );
     return () => unsub();
-  }, [notify]);
+  }, [recomputeDisplayedState]);
 
-  // 3. Subscribe to real-time Cloud Photos in Firestore (strictly read-only listener)
+  // 3. Hydrate local IndexedDB portraits FIRST, then attach a DELTA Firestore photo listener
+  //    (reads 0 documents on repeat visits when IndexedDB is already up-to-date!)
   useEffect(() => {
-    setCloudStatus('chargement');
-    const unsub = subscribeToPersonPhotos(
-      (cloudMap, fromCache) => {
-        const prevCloud = lastCloudPhotos.current;
-        lastCloudPhotos.current = cloudMap;
-        if (!isFirestoreWriteQuotaExceeded()) {
-          setCloudStatus(fromCache ? 'cache' : 'disponible');
-        }
-        setPhotosMap(cloudMap);
-        // Seamlessly merge cloud photos without ever deleting local portraits
-        setPeople((prev) => {
-          let hasDiff = false;
-          const next = prev.map((p) => {
-            const cloudPhoto = cloudMap[p.id]?.photoDataUrl;
-            if (cloudPhoto && cloudPhoto !== p.photo) {
-              hasDiff = true;
-              return { ...p, photo: cloudPhoto };
-            }
-            return p;
-          });
-          return hasDiff ? next : prev;
-        });
+    let cancelled = false;
+    let unsubPhotos: (() => void) | null = null;
 
-        // Cache only newly arrived or updated cloud photos in IndexedDB
-        Object.values(cloudMap).forEach((rec) => {
-          if (
-            rec.personId &&
-            rec.photoDataUrl &&
-            prevCloud[rec.personId]?.photoDataUrl !== rec.photoDataUrl
-          ) {
-            void savePhotoToIndexedDb({
+    const initPhotosAndDeltaSync = async () => {
+      // Load all locally cached portraits from IndexedDB
+      const localMap = await getAllPhotosFromIndexedDb();
+      if (cancelled) return;
+
+      const localKeys = Object.keys(localMap);
+      if (localKeys.length > 0) {
+        const seededRecords: Record<string, PersonPhotoRecord> = {};
+        for (const rec of Object.values(localMap)) {
+          if (rec.personId && rec.photoDataUrl) {
+            photoCacheRef.current[rec.personId] = rec.photoDataUrl;
+            seededRecords[rec.personId] = {
               personId: rec.personId,
               photoDataUrl: rec.photoDataUrl,
-              shape: rec.shape,
-              filter: rec.filter,
+              shape: (rec.shape as PersonPhotoRecord['shape']) || 'circle',
+              filter: (rec.filter as PersonPhotoRecord['filter']) || 'none',
               caption: rec.caption,
               updatedAt: rec.updatedAt,
-            });
+            };
           }
-        });
-      },
-      (err) => {
-        if (isQuotaExceededError(err)) {
-          setCloudStatus('quota');
-        } else {
-          setCloudStatus('indisponible');
-          console.warn('Real-time photo sync note:', err);
+        }
+        lastCloudPhotos.current = { ...seededRecords, ...lastCloudPhotos.current };
+        setPhotosMap((prev) => ({ ...seededRecords, ...prev }));
+        recomputeDisplayedState();
+      } else {
+        // If IndexedDB was empty, run a purely local cache scan (0 Firestore ops)
+        const { recoveredPhotos } = await runFullPhotoRecovery(peopleRef.current);
+        if (!cancelled && Object.keys(recoveredPhotos).length > 0) {
+          for (const [pid, dataUrl] of Object.entries(recoveredPhotos)) {
+            photoCacheRef.current[pid] = dataUrl;
+          }
+          recomputeDisplayedState();
         }
       }
-    );
-    return () => unsub();
-  }, []);
+
+      if (cancelled) return;
+
+      // Determine clock-skew-safe delta watermark: ONLY use delta query if an initial
+      // full server sync has completed AND IndexedDB actually holds cached portraits!
+      const savedWatermark = loadLastPhotoSyncTimestamp();
+      const effectiveSince = computeSafeDeltaWatermark(
+        savedWatermark,
+        hasCompletedInitialFullPhotoSync(),
+        localKeys.length
+      );
+
+      unsubPhotos = subscribeToPersonPhotos(
+        (deltaMap, meta) => {
+          if (cancelled) return;
+
+          const pendingPhotoIds = new Set(pendingPhotosRef.current.map((o) => o.personId));
+          const prevCloud = lastCloudPhotos.current;
+          const nextCloud = { ...prevCloud };
+          let cacheChanged = false;
+
+          // Apply new or updated portraits from Firestore (never clobbering a pending local upload!)
+          for (const rec of Object.values(deltaMap)) {
+            if (!rec.personId || !rec.photoDataUrl) continue;
+            if (pendingPhotoIds.has(rec.personId)) continue;
+
+            nextCloud[rec.personId] = rec;
+            if (photoCacheRef.current[rec.personId] !== rec.photoDataUrl) {
+              photoCacheRef.current[rec.personId] = rec.photoDataUrl;
+              cacheChanged = true;
+            }
+
+            if (prevCloud[rec.personId]?.photoDataUrl !== rec.photoDataUrl) {
+              void savePhotoToIndexedDb({
+                personId: rec.personId,
+                photoDataUrl: rec.photoDataUrl,
+                shape: rec.shape,
+                filter: rec.filter,
+                caption: rec.caption,
+                updatedAt: rec.updatedAt,
+              });
+            }
+          }
+
+          // If this is a live full snapshot from the server, mark initial sync done & propagate deletions
+          if (meta.isFullSnapshot && !meta.fromCache) {
+            markInitialFullPhotoSyncDone();
+            for (const existingId of Object.keys(prevCloud)) {
+              if (!deltaMap[existingId] && !pendingPhotoIds.has(existingId)) {
+                delete nextCloud[existingId];
+                if (!SEED_PHOTOS_BY_ID[existingId]) {
+                  delete photoCacheRef.current[existingId];
+                  void deletePhotoFromIndexedDb(existingId);
+                  cacheChanged = true;
+                }
+              }
+            }
+          }
+
+          lastCloudPhotos.current = nextCloud;
+          setPhotosMap(nextCloud);
+
+          if (!meta.fromCache && meta.maxUpdatedAt && (meta.isFullSnapshot || hasCompletedInitialFullPhotoSync())) {
+            const prevTs = loadLastPhotoSyncTimestamp();
+            if (!prevTs || meta.maxUpdatedAt > prevTs) {
+              saveLastPhotoSyncTimestamp(meta.maxUpdatedAt);
+            }
+          }
+
+          if (cacheChanged) {
+            recomputeDisplayedState();
+          }
+
+          if (
+            !isFirestoreWriteQuotaExceeded() &&
+            !isFlushingRef.current &&
+            outboxRef.current.length === 0 &&
+            pendingPhotosRef.current.length === 0
+          ) {
+            setCloudStatus(meta.fromCache ? 'cache' : 'disponible');
+          }
+        },
+        (err) => {
+          if (isQuotaExceededError(err)) {
+            setCloudStatus('quota');
+          } else {
+            console.warn('Synchronisation portraits Firestore:', err);
+          }
+        },
+        effectiveSince
+      );
+    };
+
+    void initPhotosAndDeltaSync();
+
+    return () => {
+      cancelled = true;
+      if (unsubPhotos) unsubPhotos();
+    };
+  }, [recomputeDisplayedState, photoSubVersion]);
 
   useEffect(() => {
     if (!toastMsg) return;
-    const t = setTimeout(() => setToastMsg(null), 3400);
+    const t = setTimeout(() => setToastMsg(null), 4000);
     return () => clearTimeout(t);
   }, [toastMsg]);
 
-  // Persist people changes locally (without heavy base64 strings if already in cloud to keep localStorage light)
+  // Persist people changes locally — ALWAYS stripped of base64 photos (~10KB max, NEVER hits 5MB quota!)
   useEffect(() => {
     try {
-      const compactPeople = people.map((p) =>
-        photosMap[p.id] ? { ...p, photo: undefined } : p
-      );
-      localStorage.setItem(STORAGE_PEOPLE_KEY, JSON.stringify(compactPeople));
+      const lightweight = stripPeopleForStorage(people);
+      localStorage.setItem(STORAGE_PEOPLE_KEY, JSON.stringify(lightweight));
     } catch {
-      // ignore storage quota warning since Firebase holds the main copy
+      // ignore if private browsing blocks localStorage
     }
-  }, [people, photosMap]);
+  }, [people]);
 
   // Persist settings changes locally
   useEffect(() => {
@@ -416,23 +795,46 @@ export default function App() {
       : '#FAF8F5';
 
   const handleUpdateSettings = (partial: Partial<TreeSettings>) => {
-    const next = { ...settingsRef.current, ...partial };
-    settingsRef.current = next;
-    setSettings(next);
-    // Debounce cloud writes so typing in title/subtitle/motto sends 1 write instead of 1 per keystroke
+    // Immediate optimistic local update
+    const nextSettings = { ...settingsRef.current, ...partial };
+    settingsRef.current = nextSettings;
+    setSettings(nextSettings);
+
+    // Coalesce rapid keystrokes, then enqueue isolated UPDATE_SETTINGS op (NEVER touches people!)
+    pendingSettingsPartialRef.current = {
+      ...pendingSettingsPartialRef.current,
+      ...partial,
+    };
     if (settingsSyncTimerRef.current) {
       clearTimeout(settingsSyncTimerRef.current);
     }
     settingsSyncTimerRef.current = setTimeout(() => {
       settingsSyncTimerRef.current = null;
-      void syncTreeToCloud(peopleRef.current, settingsRef.current);
-    }, 1200);
+      const mergedPartial = pendingSettingsPartialRef.current;
+      pendingSettingsPartialRef.current = {};
+      if (Object.keys(mergedPartial).length > 0) {
+        void dispatchArchiveOp({
+          opId: createOpId(),
+          createdAt: new Date().toISOString(),
+          type: 'UPDATE_SETTINGS',
+          partial: mergedPartial,
+        });
+      }
+    }, 900);
   };
 
   const handleResetSettings = () => {
-    settingsRef.current = DEFAULT_SETTINGS;
-    setSettings(DEFAULT_SETTINGS);
-    void syncTreeToCloud(peopleRef.current, DEFAULT_SETTINGS).then((ok) => {
+    if (settingsSyncTimerRef.current) {
+      clearTimeout(settingsSyncTimerRef.current);
+      settingsSyncTimerRef.current = null;
+      pendingSettingsPartialRef.current = {};
+    }
+    void dispatchArchiveOp({
+      opId: createOpId(),
+      createdAt: new Date().toISOString(),
+      type: 'RESET_SETTINGS',
+      settings: DEFAULT_SETTINGS,
+    }).then((ok) => {
       notify(
         ok
           ? 'Réglages esthétiques restaurés et synchronisés.'
@@ -462,108 +864,89 @@ export default function App() {
     setDrawerOpen(true);
   };
 
-  const handleSavePerson = (updated: Person, childIdsToAttach?: string[]) => {
+  const handleSavePerson = async (
+    updated: Person,
+    childIdsToAttach?: string[]
+  ): Promise<boolean> => {
     const prevList = peopleRef.current;
-    const prevPerson = prevList.find((p) => p.id === updated.id);
-    const isNewPerson = !prevPerson;
-    const prevSpouses = new Set(prevPerson?.spouses || []);
-    const nextSpouses = new Set(updated.spouses || []);
-    const spousesChanged =
-      prevSpouses.size !== nextSpouses.size ||
-      Array.from(nextSpouses).some((id) => !prevSpouses.has(id));
+    const isNewPerson = !prevList.some((p) => p.id === updated.id);
 
-    let nextList = isNewPerson
-      ? [...prevList, updated]
-      : prevList.map((p) => (p.id === updated.id ? updated : p));
-
-    if (childIdsToAttach) {
-      const childSet = new Set(childIdsToAttach);
-      nextList = nextList.map((p) => {
-        if (p.id === updated.id) return p;
-        const currentlyHasParent = (p.parents || []).includes(updated.id);
-        if (childSet.has(p.id) && !currentlyHasParent) {
-          return { ...p, parents: [...(p.parents || []), updated.id] };
-        }
-        if (!childSet.has(p.id) && currentlyHasParent) {
-          return { ...p, parents: (p.parents || []).filter((id) => id !== updated.id) };
-        }
-        return p;
-      });
-    }
-
-    if (spousesChanged) {
-      nextList = nextList.map((p) => {
-        if (p.id === updated.id) return p;
-        const shouldLink = nextSpouses.has(p.id);
-        const wasLinked = prevSpouses.has(p.id);
-        const hasBackLink = (p.spouses || []).includes(updated.id);
-        if (shouldLink && !hasBackLink) {
-          return { ...p, spouses: [...(p.spouses || []), updated.id] };
-        }
-        if (!shouldLink && wasLinked && hasBackLink) {
-          return { ...p, spouses: (p.spouses || []).filter((id) => id !== updated.id) };
-        }
-        return p;
-      });
-    }
-
-    peopleRef.current = nextList;
-    setPeople(nextList);
-    setSelectedPersonId(updated.id);
-
-    void syncTreeToCloud(nextList, settingsRef.current).then((ok) => {
-      notify(
-        ok
-          ? `Fiche de ${getFullName(updated)} enregistrée et synchronisée pour toute la famille.`
-          : isFirestoreWriteQuotaExceeded()
-          ? `Fiche de ${getFullName(updated)} enregistrée localement (quota journalier Firebase atteint — reprise demain).`
-          : `Fiche de ${getFullName(updated)} enregistrée localement (synchronisation cloud indisponible).`
-      );
-    });
-
+    // If a new person was created with a photo, cache & queue the photo too
     if (isNewPerson && updated.photo) {
-      void savePhotoToIndexedDb({
+      const photoUpdatedAt = new Date().toISOString();
+      photoCacheRef.current[updated.id] = updated.photo;
+      await savePhotoToIndexedDb({
         personId: updated.id,
         photoDataUrl: updated.photo,
-        updatedAt: new Date().toISOString(),
+        updatedAt: photoUpdatedAt,
       });
-      if (!isFirestoreWriteQuotaExceeded()) {
-        void savePersonPhotoToFirestore({ personId: updated.id, photoDataUrl: updated.photo })
-          .then((record) => {
-            setPhotosMap((prev) => ({ ...prev, [updated.id]: record }));
-          })
-          .catch((err) => {
-            if (isQuotaExceededError(err)) {
-              setCloudStatus('quota');
-            } else {
-              console.error('Erreur enregistrement photo Firestore:', err);
-            }
-          });
-      }
+      persistPendingPhotosState(
+        upsertPendingPhotoOp(pendingPhotosRef.current, {
+          personId: updated.id,
+          action: 'upsert',
+          updatedAt: photoUpdatedAt,
+        })
+      );
     }
+
+    const op = buildUpsertPersonOp(prevList, updated, childIdsToAttach);
+    setSelectedPersonId(updated.id);
+
+    // Enqueue immediately & wait up to 3.5s so normal saves confirm live while shaky 4G never freezes UI
+    const syncPromise = dispatchArchiveOp(op);
+    const race = await waitBriefly(syncPromise, 3500);
+    if (!race.done) {
+      notify(`Fiche de ${getFullName(updated)} enregistrée · synchronisation cloud en cours…`);
+      void syncPromise.then((finalOk) => {
+        if (finalOk) {
+          notify(`Fiche de ${getFullName(updated)} synchronisée pour toute la famille.`);
+        }
+      });
+      return true;
+    }
+
+    const ok = race.value;
+    notify(
+      ok
+        ? `Fiche de ${getFullName(updated)} enregistrée et synchronisée pour toute la famille.`
+        : isFirestoreWriteQuotaExceeded()
+        ? `Fiche de ${getFullName(updated)} enregistrée sur cet appareil (quota Firebase atteint — synchro auto dès reprise).`
+        : `Fiche de ${getFullName(updated)} enregistrée sur cet appareil (envoi vers le cloud en attente).`
+    );
+    return ok;
   };
 
   const handleDeletePerson = (id: string) => {
-    const prevList = peopleRef.current;
-    const target = prevList.find((p) => p.id === id);
-    const nextList = prevList
-      .filter((p) => p.id !== id)
-      .map((p) => ({
-        ...p,
-        parents: (p.parents || []).filter((pid) => pid !== id),
-        spouses: (p.spouses || []).filter((sid) => sid !== id),
-      }));
-
-    peopleRef.current = nextList;
-    setPeople(nextList);
+    const target = peopleRef.current.find((p) => p.id === id);
     if (focusBranch === id) setFocusBranch('all');
 
-    void syncTreeToCloud(nextList, settingsRef.current).then((ok) => {
+    // Clean up local photo cache & pending photo uploads for the deleted member
+    const hadCloudPhoto = !!lastCloudPhotos.current[id];
+    delete photoCacheRef.current[id];
+    void deletePhotoFromIndexedDb(id);
+    if (hadCloudPhoto) {
+      persistPendingPhotosState(
+        upsertPendingPhotoOp(pendingPhotosRef.current, {
+          personId: id,
+          action: 'delete',
+          updatedAt: new Date().toISOString(),
+        })
+      );
+    } else if (pendingPhotosRef.current.some((o) => o.personId === id)) {
+      persistPendingPhotosState(pendingPhotosRef.current.filter((o) => o.personId !== id));
+    }
+
+    void dispatchArchiveOp({
+      opId: createOpId(),
+      createdAt: new Date().toISOString(),
+      type: 'DELETE_PERSON',
+      personId: id,
+    }).then((ok) => {
       if (target) {
         notify(
           ok
             ? `${getFullName(target)} a été retiré(e) de l’arbre pour toute la famille.`
-            : `${getFullName(target)} retiré(e) localement (synchronisation cloud indisponible).`
+            : `${getFullName(target)} retiré(e) localement (envoi vers le cloud en attente).`
         );
       }
     });
@@ -573,108 +956,168 @@ export default function App() {
     const nextSettings = importedSettings
       ? { ...settingsRef.current, ...importedSettings }
       : settingsRef.current;
-    peopleRef.current = importedPeople;
-    setPeople(importedPeople);
-    if (importedSettings) {
-      settingsRef.current = nextSettings;
-      setSettings(nextSettings);
-    }
-    setFocusBranch('all');
-    void syncTreeToCloud(importedPeople, nextSettings);
 
-    // Enregistrement immédiat de toutes les photos dans IndexedDB
+    // Save imported portraits to IndexedDB & queue changed portraits for cloud sync
+    const nowIso = new Date().toISOString();
+    let nextPendingPhotos = pendingPhotosRef.current;
     for (const p of importedPeople) {
       if (p.photo) {
+        const isDifferentFromCloud = lastCloudPhotos.current[p.id]?.photoDataUrl !== p.photo;
+        photoCacheRef.current[p.id] = p.photo;
         void savePhotoToIndexedDb({
           personId: p.id,
           photoDataUrl: p.photo,
-          updatedAt: new Date().toISOString(),
+          updatedAt: nowIso,
         });
+        if (isDifferentFromCloud) {
+          nextPendingPhotos = upsertPendingPhotoOp(nextPendingPhotos, {
+            personId: p.id,
+            action: 'upsert',
+            updatedAt: nowIso,
+          });
+        }
       }
     }
+    if (nextPendingPhotos !== pendingPhotosRef.current) {
+      persistPendingPhotosState(nextPendingPhotos);
+    }
+
+    setFocusBranch('all');
+    void dispatchArchiveOp({
+      opId: createOpId(),
+      createdAt: nowIso,
+      type: 'REPLACE_ARCHIVE',
+      people: stripPeopleForStorage(importedPeople),
+      settings: nextSettings,
+    }).then((ok) => {
+      notify(
+        ok
+          ? `Sauvegarde importée et synchronisée (${importedPeople.length} membres).`
+          : `Sauvegarde importée localement (${importedPeople.length} membres — synchro en attente).`
+      );
+    });
   };
 
   const handleRestoreInitialData = () => {
-    const withPhotos = INITIAL_WICI_PEOPLE.map((p) => ({
-      ...p,
-      photo: photosMap[p.id]?.photoDataUrl || p.photo,
-    }));
-    peopleRef.current = withPhotos;
-    settingsRef.current = DEFAULT_SETTINGS;
-    setPeople(withPhotos);
-    setSettings(DEFAULT_SETTINGS);
     setFocusBranch('all');
-    void syncTreeToCloud(withPhotos, DEFAULT_SETTINGS).then((ok) => {
+    void dispatchArchiveOp({
+      opId: createOpId(),
+      createdAt: new Date().toISOString(),
+      type: 'REPLACE_ARCHIVE',
+      people: stripPeopleForStorage(INITIAL_WICI_PEOPLE),
+      settings: DEFAULT_SETTINGS,
+    }).then((ok) => {
       notify(
         ok
           ? 'Arbre initial de la famille Wici restauré et synchronisé.'
-          : 'Arbre initial restauré localement (synchronisation cloud indisponible).'
+          : 'Arbre initial restauré localement (synchronisation en attente).'
       );
     });
   };
 
   const handleSavePersonPhoto = async (personId: string, result: CropResult) => {
-    // 1. Mise à jour immédiate de l'état React
-    setPeople((prev) =>
-      prev.map((p) => (p.id === personId ? { ...p, photo: result.dataUrl } : p))
-    );
-
-    const personObj = people.find((p) => p.id === personId);
+    const nowIso = new Date().toISOString();
+    const personObj = peopleRef.current.find((p) => p.id === personId);
     const personName = personObj ? getFullName(personObj) : 'Membre';
 
-    // 2. Sauvegarde permanente et garantie dans IndexedDB (espace illimité)
+    // 1. Update local photo cache & UI immediately
+    photoCacheRef.current[personId] = result.dataUrl;
+    recomputeDisplayedState();
+
+    // 2. Permanent save in IndexedDB (immune to 5MB localStorage limit)
     await savePhotoToIndexedDb({
       personId,
       photoDataUrl: result.dataUrl,
       shape: result.shape,
       filter: result.filter,
       caption: result.caption,
-      updatedAt: new Date().toISOString(),
+      updatedAt: nowIso,
     });
 
-    // 3. Sauvegarde dans Firestore si connecté et quota disponible
-    if (isFirestoreWriteQuotaExceeded()) {
-      setCloudStatus('quota');
-      notify(`Portrait de ${personName} enregistré sur cet appareil (quota Firebase atteint pour aujourd’hui).`);
+    // 3. Queue into persistent pending-photos outbox so it NEVER gets lost on 4G drop or quota exhaustion
+    persistPendingPhotosState(
+      upsertPendingPhotoOp(pendingPhotosRef.current, {
+        personId,
+        action: 'upsert',
+        updatedAt: nowIso,
+      })
+    );
+
+    // 4. Flush immediately to Firestore (bounded 3.5s UI wait so shaky 4G never freezes the cropper modal)
+    const syncPromise = flushSyncQueue();
+    const race = await waitBriefly(syncPromise, 3500);
+    if (!race.done) {
+      notify(`Portrait de ${personName} enregistré · envoi vers le cloud en cours…`);
+      void syncPromise.then((finalOk) => {
+        if (finalOk) {
+          notify(`Portrait de ${personName} synchronisé pour toute la famille.`);
+        }
+      });
       return;
     }
-
-    try {
-      const savedRecord = await savePersonPhotoToFirestore({
-        personId,
-        photoDataUrl: result.dataUrl,
-        shape: result.shape,
-        filter: result.filter,
-        caption: result.caption,
-      });
-
-      if (savedRecord) {
-        setPhotosMap((prev) => ({ ...prev, [personId]: savedRecord }));
-        notify(`Portrait de ${personName} sauvegardé et synchronisé.`);
-      }
-    } catch (err: unknown) {
-      if (isQuotaExceededError(err)) {
-        setCloudStatus('quota');
-        notify(`Portrait de ${personName} sauvegardé sur cet appareil (quota journalier Firebase atteint — reprise demain).`);
-      } else {
-        console.warn('Sauvegarde Cloud Firestore différée:', err);
-        notify(`Portrait de ${personName} sauvegardé en sécurité sur votre appareil.`);
-      }
+    const ok = race.value;
+    if (ok) {
+      notify(`Portrait de ${personName} sauvegardé et synchronisé pour la famille.`);
+    } else if (isFirestoreWriteQuotaExceeded()) {
+      notify(
+        `Portrait de ${personName} enregistré sur cet appareil (quota Firebase atteint — synchro auto dès reprise).`
+      );
+    } else {
+      notify(
+        `Portrait de ${personName} enregistré en sécurité sur cet appareil (envoi vers le cloud en attente).`
+      );
     }
   };
 
   const handleRemovePersonPhoto = async (personId: string) => {
+    const nowIso = new Date().toISOString();
+    const personObj = peopleRef.current.find((p) => p.id === personId);
+    const personName = personObj ? getFullName(personObj) : 'Membre';
+    delete photoCacheRef.current[personId];
     await deletePhotoFromIndexedDb(personId);
-    await deletePersonPhotoFromFirestore(personId).catch(() => {});
-    setPeople((prev) =>
-      prev.map((p) => (p.id === personId ? { ...p, photo: undefined } : p))
+
+    persistPendingPhotosState(
+      upsertPendingPhotoOp(pendingPhotosRef.current, {
+        personId,
+        action: 'delete',
+        updatedAt: nowIso,
+      })
     );
-    setPhotosMap((prev) => {
-      const next = { ...prev };
-      delete next[personId];
-      return next;
+    recomputeDisplayedState();
+    void flushSyncQueue().then((ok) => {
+      notify(
+        ok
+          ? `Portrait de ${personName} retiré pour toute la famille.`
+          : `Portrait de ${personName} retiré localement (synchro cloud en attente).`
+      );
     });
   };
+
+  const handleForceSyncNow = async (): Promise<boolean> => {
+    const ok = await flushSyncQueue({ manual: true });
+    if (ok) {
+      notify('Toutes les modifications sont synchronisées avec Firebase.');
+    } else if (isFirestoreWriteQuotaExceeded()) {
+      notify(
+        'Le quota journalier gratuit Firebase est encore atteint. Vos modifications restent protégées sur cet appareil.'
+      );
+    } else {
+      notify('Connexion instable — nouvelle tentative automatique dès le retour du réseau.');
+    }
+    return ok;
+  };
+
+  const handleForceFullPhotoRefresh = () => {
+    resetFirestoreQuotaBreaker();
+    clearLastPhotoSyncTimestamp();
+    setPhotoSubVersion((v) => v + 1);
+    setSyncPopoverOpen(false);
+    notify('Actualisation des portraits depuis le cloud lancée…');
+  };
+
+  const totalPendingCount = pendingOutboxCount + pendingPhotosCount;
+  const isWarningStatus =
+    cloudStatus === 'indisponible' || cloudStatus === 'quota' || totalPendingCount > 0;
 
   return (
     <div
@@ -682,16 +1125,16 @@ export default function App() {
       style={{ backgroundColor: canvasBg }}
     >
       {/* Top Bar - Clean, Responsive Header */}
-      <header className="sticky top-0 z-30 flex items-center justify-between gap-3 px-4 sm:px-6 lg:px-8 h-14 bg-white/95 backdrop-blur-md border-b border-[#E6DFD3]">
+      <header className="sticky top-0 z-30 flex items-center justify-between gap-2 sm:gap-3 px-3 sm:px-6 lg:px-8 h-14 bg-white/95 backdrop-blur-md border-b border-[#E6DFD3]">
         {/* Zone 1: Brand title + member count */}
-        <div className="flex items-baseline gap-3 shrink-0">
+        <div className="flex items-baseline gap-3 shrink-0 min-w-0">
           <a
             href="#arbre"
             onClick={(e) => {
               e.preventDefault();
               setActiveTab('tree');
             }}
-            className="font-serif text-xl sm:text-2xl font-medium tracking-tight text-[#1C1917] whitespace-nowrap"
+            className="font-serif text-lg sm:text-2xl font-medium tracking-tight text-[#1C1917] whitespace-nowrap truncate"
           >
             {settings.familyName}
           </a>
@@ -737,13 +1180,13 @@ export default function App() {
           </button>
         </nav>
 
-        {/* Zone 3: Planche A3 d'Art, Partager, Cloud Sync & Add Person */}
+        {/* Zone 3: Planche A3 d'Art, Partager, Always-Visible Cloud Sync & Add Person */}
         <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           {/* Bouton Doré Dédié : Arbre A3 d'Art */}
           <button
             type="button"
             onClick={() => setPosterModalOpen(true)}
-            className="inline-flex min-h-[36px] px-3 sm:px-3.5 py-1.5 rounded-full text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 hover:opacity-95 items-center justify-center gap-1.5 shadow-xs active:scale-[0.98]"
+            className="inline-flex min-h-[36px] px-2.5 sm:px-3.5 py-1.5 rounded-full text-xs font-semibold text-white transition-all whitespace-nowrap shrink-0 hover:opacity-95 items-center justify-center gap-1.5 shadow-xs active:scale-[0.98]"
             style={{ backgroundColor: '#8C7355' }}
             title="Ouvrir le véritable arbre généalogique illustré A3 d’art avec tronc, branches et portraits"
           >
@@ -763,32 +1206,150 @@ export default function App() {
             <span className="hidden sm:inline">Partager</span>
           </button>
 
-          <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#FAF8F5] border border-[#E6DFD3] text-xs">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'bg-[#C87D55]' : 'bg-[#4D7A58]'
+          {/* Always-visible Cloud Sync Status Button + Popover (Mobile & Desktop!) */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setSyncPopoverOpen((v) => !v)}
+              aria-expanded={syncPopoverOpen}
+              className={`inline-flex min-h-[36px] items-center gap-1.5 px-2.5 lg:px-3 py-1 rounded-full border text-xs transition-colors ${
+                cloudStatus === 'synchronisation'
+                  ? 'bg-[#EEF4FA] border-[#C5D8EC] text-[#274C77]'
+                  : isWarningStatus
+                  ? 'bg-[#FDF6EE] border-[#E5C9A8] text-[#8F4D16]'
+                  : 'bg-[#FAF8F5] border-[#E6DFD3] text-[#4D7A58]'
               }`}
-            />
-            <CloudCheck
-              className={`h-3.5 w-3.5 ${
-                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'text-[#A05A37]' : 'text-[#4D7A58]'
-              }`}
-            />
-            <span
-              className={`font-medium ${
-                cloudStatus === 'indisponible' || cloudStatus === 'quota' ? 'text-[#A05A37]' : 'text-[#4D7A58]'
-              }`}
+              title="Voir l’état de synchronisation cloud Firebase"
             >
-              {cloudStatus === 'disponible'
-                ? 'Synchronisé Firebase'
-                : cloudStatus === 'cache'
-                ? 'Synchronisé (cache)'
-                : cloudStatus === 'quota'
-                ? 'Quota atteint · local'
-                : cloudStatus === 'indisponible'
-                ? 'Sauvegarde locale'
-                : 'Connexion…'}
-            </span>
+              {cloudStatus === 'synchronisation' ? (
+                <RefreshCw className="h-3.5 w-3.5 animate-spin shrink-0" />
+              ) : isWarningStatus ? (
+                <CloudOff className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <CloudCheck className="h-3.5 w-3.5 shrink-0" />
+              )}
+              <span className="font-medium whitespace-nowrap hidden lg:inline">
+                {cloudStatus === 'synchronisation'
+                  ? 'Synchronisation…'
+                  : cloudStatus === 'quota'
+                  ? totalPendingCount > 0
+                    ? `Quota · ${totalPendingCount} en attente`
+                    : 'Quota atteint · local'
+                  : totalPendingCount > 0
+                  ? `${totalPendingCount} en attente`
+                  : cloudStatus === 'indisponible'
+                  ? 'Hors ligne'
+                  : cloudStatus === 'disponible'
+                  ? 'Synchronisé'
+                  : cloudStatus === 'cache'
+                  ? 'Synchronisé (cache)'
+                  : 'Connexion…'}
+              </span>
+              {totalPendingCount > 0 && (
+                <span className="lg:hidden inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-[#B46B27] text-white text-[10px] font-bold font-mono">
+                  {totalPendingCount}
+                </span>
+              )}
+            </button>
+
+            {syncPopoverOpen && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setSyncPopoverOpen(false)}
+                />
+                <div className="absolute right-0 top-full mt-2 w-80 max-w-[92vw] bg-white border border-[#D8CFC2] rounded-2xl shadow-xl p-4 z-50 text-xs text-[#1C1917] space-y-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <p className="text-[10px] uppercase tracking-[0.16em] text-[#8C7A65] font-semibold">
+                        État de la synchronisation
+                      </p>
+                      <p className="font-serif text-base font-medium text-[#1C1917] mt-0.5">
+                        {cloudStatus === 'synchronisation'
+                          ? 'Envoi vers le cloud en cours…'
+                          : cloudStatus === 'quota'
+                          ? 'Quota journalier Firebase atteint'
+                          : totalPendingCount > 0
+                          ? `${totalPendingCount} modification${totalPendingCount > 1 ? 's' : ''} en attente`
+                          : cloudStatus === 'indisponible'
+                          ? 'Mode hors ligne (local)'
+                          : 'Arbre synchronisé pour la famille'}
+                      </p>
+                    </div>
+                    <span
+                      className={`h-2.5 w-2.5 rounded-full mt-1 shrink-0 ${
+                        cloudStatus === 'synchronisation'
+                          ? 'bg-[#274C77] animate-pulse'
+                          : isWarningStatus
+                          ? 'bg-[#C87D55]'
+                          : 'bg-[#4D7A58]'
+                      }`}
+                    />
+                  </div>
+
+                  {totalPendingCount > 0 ? (
+                    <div className="p-2.5 rounded-xl bg-[#FDF6EE] border border-[#E5C9A8] text-[#7D4B1D] space-y-1">
+                      <p className="font-medium flex items-center gap-1.5">
+                        <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                        <span>Aucune donnée n’est perdue !</span>
+                      </p>
+                      <p className="leading-relaxed text-[11px]">
+                        {pendingOutboxCount > 0 && (
+                          <span>
+                            • {pendingOutboxCount} modification{pendingOutboxCount > 1 ? 's' : ''} de fiche(s) en attente
+                            <br />
+                          </span>
+                        )}
+                        {pendingPhotosCount > 0 && (
+                          <span>
+                            • {pendingPhotosCount} portrait{pendingPhotosCount > 1 ? 's' : ''} en attente d’envoi
+                            <br />
+                          </span>
+                        )}
+                        Elles sont sauvegardées en sécurité sur cet appareil et seront envoyées automatiquement dès que Firebase sera disponible.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-xl bg-[#F0F7F2] border border-[#CDE5D5] text-[#2E6B3F] flex items-center gap-2">
+                      <Check className="h-4 w-4 shrink-0" />
+                      <span className="leading-snug">
+                        Toutes vos fiches et photos sont bien enregistrées et partagées.
+                      </span>
+                    </div>
+                  )}
+
+                  {cloudStatus === 'quota' && (
+                    <p className="text-[11px] text-[#6E665C] leading-relaxed">
+                      La limite gratuite journalière de Firebase a été atteinte aujourd’hui. Elle se réinitialise automatiquement demain : gardez cet appareil, vos modifications partiront toutes seules.
+                    </p>
+                  )}
+
+                  <div className="flex flex-col gap-1.5 pt-1 border-t border-[#F0ECE3]">
+                    <button
+                      type="button"
+                      disabled={cloudStatus === 'synchronisation'}
+                      onClick={() => void handleForceSyncNow()}
+                      className="w-full py-2 px-3 rounded-xl text-white font-medium flex items-center justify-center gap-1.5 transition-opacity hover:opacity-95 disabled:opacity-60"
+                      style={{ backgroundColor: accentColor }}
+                    >
+                      <RefreshCw
+                        className={`h-3.5 w-3.5 ${
+                          cloudStatus === 'synchronisation' ? 'animate-spin' : ''
+                        }`}
+                      />
+                      <span>Synchroniser maintenant</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleForceFullPhotoRefresh}
+                      className="w-full py-1.5 px-3 rounded-xl border border-[#E0D7C9] bg-[#FAF8F5] hover:bg-[#EFECE4] text-[#575047] font-medium transition-colors"
+                    >
+                      Actualiser tous les portraits du cloud
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
 
           {activeTab === 'tree' && (
@@ -796,7 +1357,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setMobileViewMode('canvas')}
-                className={`min-h-[32px] px-2.5 text-xs font-medium rounded-full flex items-center gap-1 ${
+                className={`min-h-[32px] px-2 text-xs font-medium rounded-full flex items-center gap-1 ${
                   mobileViewMode === 'canvas'
                     ? 'bg-white text-[#1C1917] shadow-2xs font-semibold'
                     : 'text-[#6E665C]'
@@ -804,12 +1365,12 @@ export default function App() {
                 title="Plan panoramique 2D"
               >
                 <Network className="h-3.5 w-3.5" />
-                <span>Arbre</span>
+                <span className="hidden xs:inline">Arbre</span>
               </button>
               <button
                 type="button"
                 onClick={() => setMobileViewMode('touch')}
-                className={`min-h-[32px] px-2.5 text-xs font-medium rounded-full flex items-center gap-1 ${
+                className={`min-h-[32px] px-2 text-xs font-medium rounded-full flex items-center gap-1 ${
                   mobileViewMode === 'touch'
                     ? 'bg-white text-[#1C1917] shadow-2xs font-semibold'
                     : 'text-[#6E665C]'
@@ -817,7 +1378,7 @@ export default function App() {
                 title="Navigation par foyer"
               >
                 <Smartphone className="h-3.5 w-3.5" />
-                <span>Foyer</span>
+                <span className="hidden xs:inline">Foyer</span>
               </button>
             </div>
           )}
@@ -825,7 +1386,7 @@ export default function App() {
           <button
             type="button"
             onClick={() => handleOpenCreatePerson()}
-            className="inline-flex min-h-[36px] px-3 sm:px-4 py-1.5 rounded-full text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 hover:opacity-90 items-center justify-center gap-1.5"
+            className="inline-flex min-h-[36px] px-2.5 sm:px-4 py-1.5 rounded-full text-xs font-medium text-white transition-colors whitespace-nowrap shrink-0 hover:opacity-90 items-center justify-center gap-1.5"
             style={{ backgroundColor: accentColor }}
           >
             <UserPlus className="h-3.5 w-3.5" />
@@ -834,6 +1395,43 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Non-intrusive Pending Sync / Quota Banner (visible on mobile & desktop whenever edits are waiting) */}
+      {(totalPendingCount > 0 || cloudStatus === 'quota') && (
+        <div className="bg-[#FDF6EE] border-b border-[#E5C9A8] px-4 py-2 text-xs text-[#7D4B1D] flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="h-4 w-4 shrink-0 text-[#B46B27]" />
+            <span>
+              {cloudStatus === 'quota' ? (
+                <>
+                  <b>Quota Firebase du jour atteint.</b>{' '}
+                  {totalPendingCount > 0
+                    ? `${totalPendingCount} modification${totalPendingCount > 1 ? 's' : ''} sauvegardée${totalPendingCount > 1 ? 's' : ''} sur cet appareil — envoi automatique dès réinitialisation.`
+                    : 'Vos consultations et exports PDF continuent de fonctionner normalement.'}
+                </>
+              ) : (
+                <>
+                  <b>
+                    {totalPendingCount} modification{totalPendingCount > 1 ? 's' : ''} en attente d’envoi
+                  </b>{' '}
+                  (sauvegardée{totalPendingCount > 1 ? 's' : ''} en sécurité sur cet appareil).
+                </>
+              )}
+            </span>
+          </div>
+          <button
+            type="button"
+            disabled={cloudStatus === 'synchronisation'}
+            onClick={() => void handleForceSyncNow()}
+            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white border border-[#D8B994] hover:bg-[#FAF1E6] text-[#7D4B1D] font-semibold whitespace-nowrap disabled:opacity-60"
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${cloudStatus === 'synchronisation' ? 'animate-spin' : ''}`}
+            />
+            <span>Réessayer</span>
+          </button>
+        </div>
+      )}
 
       {/* Main Content View */}
       <main className="flex-1 flex flex-col">
@@ -908,7 +1506,9 @@ export default function App() {
             settings={settings}
             onUpdateSettings={handleUpdateSettings}
             onResetSettings={handleResetSettings}
-            onSavePerson={(p) => handleSavePerson(p)}
+            onSavePerson={(p) => {
+              void handleSavePerson(p);
+            }}
             onDeletePerson={handleDeletePerson}
             onOpenPersonDrawer={handleOpenPerson}
             onAddChildFor={(parentId) => handleOpenCreatePerson(parentId)}
@@ -1017,6 +1617,9 @@ export default function App() {
           people={people}
           settings={settings}
           accentColor={accentColor}
+          pendingSyncCount={totalPendingCount}
+          cloudStatus={cloudStatus}
+          onForceSync={handleForceSyncNow}
           onOpenShare={() => {
             setPosterModalOpen(false);
             setShareModalOpen(true);
@@ -1039,7 +1642,7 @@ export default function App() {
       {toastMsg && (
         <div
           role="status"
-          className="fixed bottom-16 md:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1C1917] text-[#FAF8F5] px-5 py-2.5 rounded-full text-xs font-medium shadow-lg border border-[#3D3832]"
+          className="fixed bottom-16 md:bottom-6 left-1/2 -translate-x-1/2 z-50 bg-[#1C1917] text-[#FAF8F5] px-5 py-2.5 rounded-full text-xs font-medium shadow-lg border border-[#3D3832] max-w-[92vw] text-center"
         >
           {toastMsg}
         </div>
